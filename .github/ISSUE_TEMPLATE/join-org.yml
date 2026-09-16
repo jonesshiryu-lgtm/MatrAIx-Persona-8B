@@ -1,0 +1,27 @@
+name: Join the MatrAIx-ai organization
+description: Request an invitation to the MatrAIx-ai GitHub organization.
+title: "Org membership request"
+labels: ["org-invite"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for your interest in MatrAIx! Fill in the two fields below and submit.
+        A maintainer reviews requests regularly; once approved, the invitation is sent
+        automatically to the GitHub account that opened this issue, and you will get
+        an email and a notification from GitHub.
+  - type: input
+    id: affiliation
+    attributes:
+      label: Who you are
+      description: Name and affiliation (university, company, or independent).
+      placeholder: e.g. Jane Doe, PhD student at MIT
+    validations:
+      required: true
+  - type: textarea
+    id: purpose
+    attributes:
+      label: What you want to work on
+      description: One or two sentences on how you plan to use or contribute to MatrAIx.
+    validations:
+      required: true
