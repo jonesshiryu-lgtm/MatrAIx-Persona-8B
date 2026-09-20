@@ -337,6 +337,8 @@
   "cockpitSetup.run.liveHint": "中央フレームにライブ更新が表示されます。",
   "cockpitSetup.run.parallel": "並列",
   "cockpitSetup.run.reset": "リセット",
+  "cockpitSetup.run.resumeBatch": "バッチを再開 ({count})",
+  "cockpitSetup.run.resuming": "再開中…",
   "cockpitSetup.run.retryFailed": "失敗を再試行 ({count})",
   "cockpitSetup.run.retrying": "再試行中…",
   "cockpitSetup.run.runBatch": "バッチ実行 ({count})",

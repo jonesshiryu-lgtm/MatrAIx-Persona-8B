@@ -248,6 +248,11 @@ export function SurveyEvalCockpit({
       retryFailed,
       retryBusy,
       retryError,
+      resumeBatch,
+      resumeBusy,
+      resumeError,
+      batchResumable,
+      pendingTrials,
       failedTrials,
       isBatchActive,
       batchComplete,
@@ -627,7 +632,8 @@ export function SurveyEvalCockpit({
             launchError ??
             displayError ??
             (batchCancelled ? t("eval.progress.batchStoppedReset") : batchError) ??
-            retryError
+            retryError ??
+            resumeError
           }
           onNewRun={showLiveCenter ? handleNewRun : undefined}
           onConfigAnotherRun={
@@ -656,6 +662,11 @@ export function SurveyEvalCockpit({
           }
           failedCount={failedTrials}
           retryBusy={retryBusy}
+          onResumeBatch={
+            batchResumable ? () => void resumeBatch() : undefined
+          }
+          pendingCount={pendingTrials}
+          resumeBusy={resumeBusy}
         />
       }
       right={

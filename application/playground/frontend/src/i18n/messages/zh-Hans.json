@@ -337,6 +337,8 @@
   "cockpitSetup.run.liveHint": "实时更新会显示在中央画面。",
   "cockpitSetup.run.parallel": "并行数",
   "cockpitSetup.run.reset": "重置",
+  "cockpitSetup.run.resumeBatch": "续跑批次（{count}）",
+  "cockpitSetup.run.resuming": "正在续跑…",
   "cockpitSetup.run.retryFailed": "重试失败项（{count}）",
   "cockpitSetup.run.retrying": "正在重试…",
   "cockpitSetup.run.runBatch": "运行批量任务（{count}）",

@@ -30,6 +30,10 @@ export interface RunLaunchBarProps {
   onRetryFailed?: () => void;
   failedCount?: number;
   retryBusy?: boolean;
+  /** Continue a batch whose dispatcher died with the API process (batch only). */
+  onResumeBatch?: () => void;
+  pendingCount?: number;
+  resumeBusy?: boolean;
   /** When the live panel already shows a failure card, keep the bar to actions only. */
   compactOnFailure?: boolean;
   /** Open the confirm dialog to background this batch and reset setup. */
@@ -61,6 +65,9 @@ export function RunLaunchBar({
   onRetryFailed,
   failedCount = 0,
   retryBusy = false,
+  onResumeBatch,
+  pendingCount = 0,
+  resumeBusy = false,
   onConfigAnotherRun,
   configAnotherOpen = false,
   onConfirmConfigAnother,
@@ -87,7 +94,7 @@ export function RunLaunchBar({
       {active ? (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2.5">
-            <div className="flex min-w-0 flex-1 items-center gap-2.5">
+            <div className="flex min-w-0 grow basis-56 items-center gap-2.5">
               {failed ? (
                 <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-danger/12">
                   <Sym
@@ -132,13 +139,15 @@ export function RunLaunchBar({
               </div>
             </div>
 
-            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            {/* Below sm the actions drop to their own full-width row and share it
+                evenly — otherwise they squeeze the progress label to "0 of 200…". */}
+            <div className="flex w-full flex-wrap items-center gap-2 sm:ml-auto sm:w-auto sm:shrink-0 sm:justify-end">
               {onCancelRun && !done && !failed && (
                 <button
                   type="button"
                   onClick={onCancelRun}
                   disabled={cancelRunBusy}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border border-danger/35 bg-danger/8 px-3.5 py-2 text-[14px] font-medium text-danger transition hover:border-danger/50 hover:bg-danger/14 active:scale-[0.98] disabled:opacity-50 ${FOCUS_RING}`}
+                  className={`inline-flex min-w-[8.5rem] flex-1 items-center justify-center gap-1.5 rounded-lg border border-danger/35 bg-danger/8 px-3.5 py-2 text-[14px] font-medium text-danger transition hover:border-danger/50 hover:bg-danger/14 active:scale-[0.98] disabled:opacity-50 sm:min-w-0 sm:flex-none ${FOCUS_RING}`}
                 >
                   <Sym name="stop_circle" size={16} />
                   {cancelRunBusy
@@ -152,7 +161,7 @@ export function RunLaunchBar({
                 <button
                   type="button"
                   onClick={onConfigAnotherRun}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border border-outline/55 bg-transparent px-3.5 py-2 text-[14px] font-medium text-text-variant transition hover:border-outline hover:bg-surface-low hover:text-text-main active:scale-[0.98] ${FOCUS_RING}`}
+                  className={`inline-flex min-w-[8.5rem] flex-1 items-center justify-center gap-1.5 rounded-lg border border-outline/55 bg-transparent px-3.5 py-2 text-[14px] font-medium text-text-variant transition hover:border-outline hover:bg-surface-low hover:text-text-main active:scale-[0.98] sm:min-w-0 sm:flex-none ${FOCUS_RING}`}
                 >
                   <Sym name="tune" size={16} />
                   {t("cockpitSetup.run.configAnother")}
@@ -166,7 +175,7 @@ export function RunLaunchBar({
                     type="button"
                     onClick={onRetryFailed}
                     disabled={retryBusy}
-                    className={`inline-flex items-center gap-1.5 rounded-lg border border-[#e5c07b]/45 bg-[#e5c07b]/10 px-3.5 py-2 text-[14px] font-medium text-[#e5c07b] transition hover:border-[#e5c07b]/60 hover:bg-[#e5c07b]/16 active:scale-[0.98] disabled:opacity-50 ${FOCUS_RING}`}
+                    className={`inline-flex min-w-[8.5rem] flex-1 items-center justify-center gap-1.5 rounded-lg border border-[#e5c07b]/45 bg-[#e5c07b]/10 px-3.5 py-2 text-[14px] font-medium text-[#e5c07b] transition hover:border-[#e5c07b]/60 hover:bg-[#e5c07b]/16 active:scale-[0.98] disabled:opacity-50 sm:min-w-0 sm:flex-none ${FOCUS_RING}`}
                   >
                     <Sym
                       name="replay"
@@ -180,12 +189,31 @@ export function RunLaunchBar({
                         })}
                   </button>
                 )}
+              {onResumeBatch && isBatch && pendingCount > 0 && (
+                <button
+                  type="button"
+                  onClick={onResumeBatch}
+                  disabled={resumeBusy}
+                  className={`inline-flex min-w-[8.5rem] flex-1 items-center justify-center gap-1.5 rounded-lg border border-primary/45 bg-primary/10 px-3.5 py-2 text-[14px] font-medium text-primary transition hover:border-primary/60 hover:bg-primary/16 active:scale-[0.98] disabled:opacity-50 sm:min-w-0 sm:flex-none ${FOCUS_RING}`}
+                >
+                  <Sym
+                    name="play_circle"
+                    size={16}
+                    className={resumeBusy ? "animate-rb-spin" : undefined}
+                  />
+                  {resumeBusy
+                    ? t("cockpitSetup.run.resuming")
+                    : t("cockpitSetup.run.resumeBatch", {
+                        count: pendingCount,
+                      })}
+                </button>
+              )}
               {onDownload && (done || failed) && !onViewJob && (
                 <button
                   type="button"
                   onClick={onDownload}
                   disabled={!canDownload}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border border-outline/60 bg-surface/40 px-3.5 py-2 text-[14px] font-medium text-text-variant backdrop-blur-sm transition hover:border-outline hover:bg-surface-high hover:text-text-main active:scale-[0.98] disabled:opacity-50 ${FOCUS_RING}`}
+                  className={`inline-flex min-w-[8.5rem] flex-1 items-center justify-center gap-1.5 rounded-lg border border-outline/60 bg-surface/40 px-3.5 py-2 text-[14px] font-medium text-text-variant backdrop-blur-sm transition hover:border-outline hover:bg-surface-high hover:text-text-main active:scale-[0.98] disabled:opacity-50 sm:min-w-0 sm:flex-none ${FOCUS_RING}`}
                 >
                   <Sym name="download" size={16} />
                   {t("cockpitSetup.run.download")}
@@ -195,7 +223,7 @@ export function RunLaunchBar({
                 <button
                   type="button"
                   onClick={onViewJob}
-                  className={`inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 font-display text-[14px] font-semibold text-on-primary shadow-[0_2px_10px_-4px_rgb(0_0_0/0.45)] transition hover:bg-primary-dim active:scale-[0.98] ${FOCUS_RING}`}
+                  className={`inline-flex min-w-[8.5rem] flex-1 items-center justify-center gap-1.5 rounded-lg bg-primary px-4 py-2 font-display text-[14px] font-semibold text-on-primary shadow-[0_2px_10px_-4px_rgb(0_0_0/0.45)] transition hover:bg-primary-dim active:scale-[0.98] sm:min-w-0 sm:flex-none ${FOCUS_RING}`}
                 >
                   <Sym name="open_in_new" size={16} />
                   {isBatch
@@ -207,7 +235,7 @@ export function RunLaunchBar({
                 <button
                   type="button"
                   onClick={onNewRun}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border border-outline/55 bg-transparent px-3.5 py-2 text-[14px] font-medium text-text-dim transition hover:border-outline hover:bg-surface-low hover:text-text-variant active:scale-[0.98] ${FOCUS_RING}`}
+                  className={`inline-flex min-w-[8.5rem] flex-1 items-center justify-center gap-1.5 rounded-lg border border-outline/55 bg-transparent px-3.5 py-2 text-[14px] font-medium text-text-dim transition hover:border-outline hover:bg-surface-low hover:text-text-variant active:scale-[0.98] sm:min-w-0 sm:flex-none ${FOCUS_RING}`}
                 >
                   <Sym name="restart_alt" size={16} />
                   {t("cockpitSetup.run.reset")}

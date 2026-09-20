@@ -33,6 +33,9 @@ export interface CockpitRunCenterProps {
   onRetryFailed?: () => void;
   failedCount?: number;
   retryBusy?: boolean;
+  onResumeBatch?: () => void;
+  pendingCount?: number;
+  resumeBusy?: boolean;
   onConfigAnotherRun?: () => void;
   configAnotherOpen?: boolean;
   onConfirmConfigAnother?: () => void;
@@ -68,6 +71,9 @@ export function CockpitRunCenter({
   onRetryFailed,
   failedCount,
   retryBusy,
+  onResumeBatch,
+  pendingCount,
+  resumeBusy,
   onConfigAnotherRun,
   configAnotherOpen,
   onConfirmConfigAnother,
@@ -108,6 +114,9 @@ export function CockpitRunCenter({
         onRetryFailed={onRetryFailed}
         failedCount={failedCount}
         retryBusy={retryBusy}
+        onResumeBatch={onResumeBatch}
+        pendingCount={pendingCount}
+        resumeBusy={resumeBusy}
         onConfigAnotherRun={onConfigAnotherRun}
         configAnotherOpen={configAnotherOpen}
         onConfirmConfigAnother={onConfirmConfigAnother}

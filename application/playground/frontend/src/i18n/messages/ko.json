@@ -337,6 +337,8 @@
   "cockpitSetup.run.liveHint": "가운데 프레임에 실시간 업데이트가 표시됩니다.",
   "cockpitSetup.run.parallel": "병렬",
   "cockpitSetup.run.reset": "재설정",
+  "cockpitSetup.run.resumeBatch": "배치 재개 ({count})",
+  "cockpitSetup.run.resuming": "재개 중…",
   "cockpitSetup.run.retryFailed": "실패 재시도 ({count})",
   "cockpitSetup.run.retrying": "재시도 중…",
   "cockpitSetup.run.runBatch": "배치 실행 ({count})",

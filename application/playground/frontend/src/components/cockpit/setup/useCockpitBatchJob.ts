@@ -13,6 +13,7 @@ import { useUrlState } from "@/lib/useUrlState";
 import { useHarborBatchStatus } from "@/lib/useHarborBatchStatus";
 
 import { buildBatchCellsFromStatus, buildBatchGridCells } from "./BatchTrialGrid";
+import { isBatchResumable } from "./batchResume";
 import { readCockpitBatch, writeCockpitBatch } from "./cockpitBatchStorage";
 import { BATCH_MOSAIC_THRESHOLD } from "./useBatchGridLayout";
 import type { RunLaunchPhase } from "./RunLaunchBar";
@@ -145,6 +146,8 @@ export function useCockpitBatchJob(
   const [cancelBusy, setCancelBusy] = useState(false);
   const [retryBusy, setRetryBusy] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
 
   const cancelBatch = useCallback(async () => {
     if (!batchJobName || cancelBusy || batchCancelled) return;
@@ -170,6 +173,19 @@ export function useCockpitBatchJob(
       setRetryBusy(false);
     }
   }, [batchJobName, retryBusy]);
+
+  const resumeBatch = useCallback(async () => {
+    if (!batchJobName || resumeBusy) return;
+    setResumeBusy(true);
+    setResumeError(null);
+    try {
+      await api.resumeHarborJob(batchJobName);
+    } catch (exc) {
+      setResumeError(exc instanceof Error ? exc.message : String(exc));
+    } finally {
+      setResumeBusy(false);
+    }
+  }, [batchJobName, resumeBusy]);
 
   // Preview-only: launch uses the full ID list; the mosaic does not need every card.
   const previewPersonaIds = useMemo(
@@ -274,6 +290,19 @@ export function useCockpitBatchJob(
     completedTrials >= expectedTrialCount &&
     expectedTrialCount > 0;
 
+  // An interrupted local batch keeps its unfinished trials on disk but has no
+  // launch record in the API process any more — that is the resumable window.
+  const batchFeed = aggregate ? statusSnapshot : batchLive.live;
+  const pendingTrials = Math.max(expectedTrialCount - completedTrials, 0);
+  const batchResumable = isBatchResumable({
+    batchJobName,
+    batchCancelled,
+    batchComplete,
+    launchStatus: batchFeed?.launchStatus ?? null,
+    observed: batchFeed != null,
+    pendingTrials,
+  });
+
   const batchGridCells = useMemo(() => {
     if (aggregate && statusSnapshot) {
       return buildBatchCellsFromStatus(statusSnapshot, {
@@ -313,6 +342,11 @@ export function useCockpitBatchJob(
     retryFailed,
     retryBusy,
     retryError,
+    resumeBatch,
+    resumeBusy,
+    resumeError,
+    batchResumable,
+    pendingTrials,
     failedTrials,
     isBatchActive,
     batchComplete,

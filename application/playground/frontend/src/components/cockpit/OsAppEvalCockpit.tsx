@@ -183,6 +183,11 @@ export function OsAppEvalCockpit({
       retryFailed,
       retryBusy,
       retryError,
+      resumeBatch,
+      resumeBusy,
+      resumeError,
+      batchResumable,
+      pendingTrials,
       failedTrials,
       isBatchActive,
       batchComplete,
@@ -538,6 +543,7 @@ export function OsAppEvalCockpit({
             launchError ??
             (batchCancelled ? t("eval.progress.batchStoppedReset") : batchError) ??
             retryError ??
+            resumeError ??
             (failed && !batchJobName ? null : displayError)
           }
           onNewRun={showLiveCenter ? handleNewRun : undefined}
@@ -567,6 +573,11 @@ export function OsAppEvalCockpit({
           }
           failedCount={failedTrials}
           retryBusy={retryBusy}
+          onResumeBatch={
+            batchResumable ? () => void resumeBatch() : undefined
+          }
+          pendingCount={pendingTrials}
+          resumeBusy={resumeBusy}
         />
       }
       right={

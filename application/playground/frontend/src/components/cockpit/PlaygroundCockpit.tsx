@@ -357,6 +357,11 @@ function ChatbotEvalCockpit({
       retryFailed,
       retryBusy,
       retryError,
+      resumeBatch,
+      resumeBusy,
+      resumeError,
+      batchResumable,
+      pendingTrials,
       failedTrials,
       isBatchActive,
       batchComplete,
@@ -943,7 +948,8 @@ function ChatbotEvalCockpit({
               launchError ??
               (verifierOnlyFailure ? null : displayError) ??
               (batchCancelled ? t("eval.progress.batchStoppedReset") : batchError) ??
-              retryError
+              retryError ??
+              resumeError
             }
             runPhase={runLaunchPhase}
             progressPct={runProgressPct}
@@ -980,6 +986,11 @@ function ChatbotEvalCockpit({
             }
             failedCount={failedTrials}
             retryBusy={retryBusy}
+            onResumeBatch={
+              batchResumable ? () => void resumeBatch() : undefined
+            }
+            pendingCount={pendingTrials}
+            resumeBusy={resumeBusy}
           />
         </div>
       }

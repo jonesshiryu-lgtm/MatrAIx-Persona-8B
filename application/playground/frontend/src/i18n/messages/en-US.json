@@ -337,6 +337,8 @@
   "cockpitSetup.run.liveHint": "Live updates appear in the center frame.",
   "cockpitSetup.run.parallel": "Parallel",
   "cockpitSetup.run.reset": "Reset",
+  "cockpitSetup.run.resumeBatch": "Resume batch ({count})",
+  "cockpitSetup.run.resuming": "Resuming…",
   "cockpitSetup.run.retryFailed": "Retry failed ({count})",
   "cockpitSetup.run.retrying": "Retrying…",
   "cockpitSetup.run.runBatch": "Run Batch ({count})",

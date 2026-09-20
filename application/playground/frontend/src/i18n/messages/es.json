@@ -337,6 +337,8 @@
   "cockpitSetup.run.liveHint": "Las actualizaciones en vivo aparecen en el marco central.",
   "cockpitSetup.run.parallel": "Paralelo",
   "cockpitSetup.run.reset": "Restablecer",
+  "cockpitSetup.run.resumeBatch": "Reanudar lote ({count})",
+  "cockpitSetup.run.resuming": "Reanudando…",
   "cockpitSetup.run.retryFailed": "Reintentar fallidos ({count})",
   "cockpitSetup.run.retrying": "Reintentando…",
   "cockpitSetup.run.runBatch": "Ejecutar lote ({count})",

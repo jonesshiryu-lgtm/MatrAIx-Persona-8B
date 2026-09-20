@@ -204,6 +204,11 @@ export function WebEvalCockpit({
       retryFailed,
       retryBusy,
       retryError,
+      resumeBatch,
+      resumeBusy,
+      resumeError,
+      batchResumable,
+      pendingTrials,
       failedTrials,
       isBatchActive,
       batchComplete,
@@ -584,7 +589,8 @@ export function WebEvalCockpit({
               launchError ??
                 error ??
                 (batchCancelled ? t("eval.progress.batchStoppedReset") : batchError) ??
-                retryError,
+                retryError ??
+                resumeError,
             ),
             t,
           )}
@@ -615,6 +621,11 @@ export function WebEvalCockpit({
           }
           failedCount={failedTrials}
           retryBusy={retryBusy}
+          onResumeBatch={
+            batchResumable ? () => void resumeBatch() : undefined
+          }
+          pendingCount={pendingTrials}
+          resumeBusy={resumeBusy}
         />
       }
       right={

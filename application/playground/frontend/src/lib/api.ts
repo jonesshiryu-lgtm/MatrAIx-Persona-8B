@@ -61,11 +61,36 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // Non-JSON error bodies (FastAPI returns plain "Internal Server Error"
+      // for unhandled exceptions) must not be masked by a JSON parse error —
+      // the status code and body are the only useful signal we have.
+      data = null;
+    }
+  }
   if (!response.ok) {
-    const detail = data && typeof data === "object" && "detail" in data ? data.detail : data;
-    const message = typeof detail === "string" ? detail : response.statusText;
-    throw new ApiError(response.status, message || "Request failed", detail);
+    const detail =
+      data && typeof data === "object" && "detail" in data
+        ? (data as { detail: unknown }).detail
+        : data;
+    // A string `detail` is already a readable message. Otherwise the raw body is
+    // all we have (FastAPI answers plain text "Internal Server Error" for
+    // unhandled exceptions) and the status is what makes it actionable.
+    const snippet = text.trim().slice(0, 300);
+    const statusLabel = `HTTP ${response.status}${
+      response.statusText ? ` ${response.statusText}` : ""
+    }`;
+    const message =
+      typeof detail === "string"
+        ? detail
+        : snippet
+          ? `${statusLabel}: ${snippet}`
+          : statusLabel;
+    throw new ApiError(response.status, message, detail);
   }
   return data as T;
 }
@@ -146,6 +171,11 @@ export const api = {
   retryHarborJobFailed: (jobName: string) =>
     request<{ jobName: string; retried: number }>(
       `/api/harbor/jobs/${encodeURIComponent(jobName)}/retry-failed`,
+      { method: "POST" },
+    ),
+  resumeHarborJob: (jobName: string) =>
+    request<{ jobName: string; resumed: number }>(
+      `/api/harbor/jobs/${encodeURIComponent(jobName)}/resume`,
       { method: "POST" },
     ),
   getHarborJobAggregation: (jobName: string) =>
