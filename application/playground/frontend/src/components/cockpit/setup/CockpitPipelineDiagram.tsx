@@ -60,7 +60,7 @@ function PipelineNode({
 }: NodeProps) {
   return (
     <div
-      className={`rise-in flex w-[118px] shrink-0 flex-col items-center rounded-2xl border px-3 py-4 text-center transition-all duration-500 sm:w-[132px] ${
+      className={`rise-in flex w-[104px] shrink-0 flex-col items-center rounded-2xl border px-2 py-4 text-center transition-all duration-500 sm:w-[132px] sm:px-3 ${
         visible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-3"
       } ${active ? "glass-tile glass-tile--active" : "glass-tile"}`}
     >
@@ -237,6 +237,13 @@ function PipelinePathFork({
   );
 }
 
+/**
+ * Floor for the pipeline shrink-to-fit. Low enough that a narrow stage still
+ * fits in one piece, high enough that the node labels stay readable (below
+ * this the row scrolls horizontally instead of shrinking further).
+ */
+const MIN_PIPELINE_SCALE = 0.7;
+
 /** Shrink wide pipeline rows so they stay inside the center column. */
 function PipelineScaleFit({
   children,
@@ -247,7 +254,7 @@ function PipelineScaleFit({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const [scale, setScale] = useState(1);
+  const [fit, setFit] = useState<{ scale: number; width: number } | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -256,12 +263,18 @@ function PipelineScaleFit({
 
     const update = () => {
       const available = container.clientWidth;
+      // The row's `w-max` keeps `scrollWidth` at its natural width, so this stays
+      // stable even after we narrow the element below.
       const needed = content.scrollWidth;
       if (needed <= available || available <= 0) {
-        setScale(1);
+        setFit(null);
         return;
       }
-      setScale(Math.max(0.78, available / needed));
+      const scale = Math.max(MIN_PIPELINE_SCALE, available / needed);
+      // Also shrink the box: a bare `transform` scales the paint but leaves the
+      // unscaled layout size behind, which left the parent with a phantom
+      // horizontal scrollbar and a half-clipped diagram.
+      setFit({ scale, width: needed * scale });
     };
 
     update();
@@ -278,10 +291,14 @@ function PipelineScaleFit({
     >
       <div
         ref={contentRef}
-        className="transition-transform duration-300"
+        className="transition-[transform,width] duration-300"
         style={
-          scale < 1
-            ? { transform: `scale(${scale})`, transformOrigin: "center center" }
+          fit
+            ? {
+                transform: `scale(${fit.scale})`,
+                transformOrigin: "left center",
+                width: fit.width,
+              }
             : undefined
         }
       >
@@ -348,31 +365,35 @@ export function CockpitPipelineDiagram({
   const pipelineBody = (
     <>
       {taskType === "survey" && (
-        <div className={PIPELINE_ROW_CLASS}>
-          <PipelineNode
-            label={t("cockpitSetup.pipeline.persona")}
-            icon="face"
-            detail={resolvedPersonaModelLabel}
-            active={hasPersona}
-            visible={v(1)}
-          />
-          <Arrow visible={v(2)} />
-          <PipelineNode
-            label={t("cockpitSetup.pipeline.survey")}
-            icon="quiz"
-            detail={t("cockpitSetup.pipeline.instrument")}
-            active={hasTask}
-            visible={v(2)}
-          />
-          <Arrow visible={v(3)} />
-          <PipelineNode
-            label={t("cockpitSetup.pipeline.evaluation")}
-            icon={PIPELINE_EVALUATION.icon}
-            detail={t("cockpitSetup.pipeline.metricCollection")}
-            active={ready}
-            visible={v(3)}
-          />
-        </div>
+        <PipelineScaleFit
+          deps={[taskType, personaModelLabel, resolvedPersonaModelLabel, hasPersona, hasTask, revealed]}
+        >
+          <div className={PIPELINE_ROW_CLASS}>
+            <PipelineNode
+              label={t("cockpitSetup.pipeline.persona")}
+              icon="face"
+              detail={resolvedPersonaModelLabel}
+              active={hasPersona}
+              visible={v(1)}
+            />
+            <Arrow visible={v(2)} />
+            <PipelineNode
+              label={t("cockpitSetup.pipeline.survey")}
+              icon="quiz"
+              detail={t("cockpitSetup.pipeline.instrument")}
+              active={hasTask}
+              visible={v(2)}
+            />
+            <Arrow visible={v(3)} />
+            <PipelineNode
+              label={t("cockpitSetup.pipeline.evaluation")}
+              icon={PIPELINE_EVALUATION.icon}
+              detail={t("cockpitSetup.pipeline.metricCollection")}
+              active={ready}
+              visible={v(3)}
+            />
+          </div>
+        </PipelineScaleFit>
       )}
 
       {taskType === "chatbot" && (

@@ -10,6 +10,18 @@ const CHIP_HEIGHT = 46;
 const CHIP_MIN_HEIGHT = 44;
 
 /**
+ * Minimum chip width for a given stage width. A chip carries an avatar, a name
+ * and a persona id, so 108px only works when the stage is roomy. On narrow
+ * stages we drop to fewer, wider columns instead of truncating every name to
+ * "To…". Rows still virtualize, so the DOM stays bounded either way.
+ */
+function minChipWidth(stageWidth: number): number {
+  if (stageWidth < 560) return 176;
+  if (stageWidth < 900) return 140;
+  return CHIP_WIDTH;
+}
+
+/**
  * Cohort display tiers. The roster scales from individual portraits to an
  * aggregate pixel-wall as the population grows, keeping the DOM bounded.
  */
@@ -88,9 +100,10 @@ function computeChipsLayout(
   width: number,
   height: number,
 ): Pick<BatchGridLayout, "cols" | "rows" | "scroll" | "rowHeight"> {
+  const chipMin = minChipWidth(width);
   const cols = Math.max(
     1,
-    Math.min(count, Math.floor((width + CHIP_GAP_PX) / (CHIP_WIDTH + CHIP_GAP_PX))),
+    Math.min(count, Math.floor((width + CHIP_GAP_PX) / (chipMin + CHIP_GAP_PX))),
   );
   const rows = Math.ceil(count / cols);
   const contentMin = rows * CHIP_MIN_HEIGHT + (rows - 1) * CHIP_GAP_PX;

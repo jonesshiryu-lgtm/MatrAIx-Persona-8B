@@ -90,7 +90,10 @@ export function TopBar({
         glass ? "absolute inset-x-0 top-0" : "relative"
       }`}
     >
-      <div className="grid h-14 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 px-5">
+      {/* Below md the centred nav is hidden, so the symmetric three-column track
+          is dropped: reserving equal halves squeezed the brand under the
+          right-hand controls and the two overlapped. */}
+      <div className="grid h-14 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-5 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
         <div className="flex min-w-0 items-center justify-start">
           <MatrAIxLogo size="md" onClick={onOpenHome} />
         </div>

@@ -11,7 +11,7 @@ export interface CockpitLiveStageProps {
 export function CockpitLiveStage({ children, className = "", fillContent = false }: CockpitLiveStageProps) {
   return (
     <div
-      className={`glass-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-outline/40 ${className}`}
+      className={`glass-panel flex min-h-0 max-xl:min-h-[26rem] flex-1 flex-col overflow-hidden rounded-xl border border-outline/40 ${className}`}
     >
       <div
         className={

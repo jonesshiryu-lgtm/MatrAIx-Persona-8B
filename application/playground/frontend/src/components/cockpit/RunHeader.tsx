@@ -21,17 +21,23 @@ function subtitle(t: Translate, taskType: PlaygroundTaskType): string {
   }
 }
 
-/** Dense one-line header: title · subtitle inline · app-type switch right. */
+/**
+ * Dense header: title · subtitle · app-type switch.
+ *
+ * Below `xl` the three parts stack (title / full-width subtitle / switch) and
+ * the subtitle wraps instead of being truncated to a few words while the switch
+ * is crushed against it. From `xl` it collapses back to one line.
+ */
 export function RunHeader({ taskType, onTaskTypeChange }: RunHeaderProps) {
   const { t } = useI18n();
   const taskSubtitle = subtitle(t, taskType);
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
       <h1 className="shrink-0 font-display text-[18px] font-bold leading-tight tracking-tight text-text-main">
         {t("runHeader.title")}
       </h1>
       <p
-        className="min-w-0 flex-1 basis-64 truncate text-[13.5px] leading-snug text-text-variant"
+        className="min-w-0 grow basis-full text-[13.5px] leading-snug text-text-variant xl:basis-64 xl:truncate"
         title={taskSubtitle}
       >
         {taskSubtitle}
@@ -40,7 +46,7 @@ export function RunHeader({ taskType, onTaskTypeChange }: RunHeaderProps) {
         value={taskType}
         onChange={onTaskTypeChange}
         showLabel={false}
-        className="ml-auto shrink-0"
+        className="flex w-full shrink-0 justify-start xl:ml-auto xl:w-auto xl:justify-end"
       />
     </div>
   );

@@ -50,9 +50,11 @@ function optionCopy(t: Translate, type: PlaygroundTaskType): { label: string; hi
 export function TaskTypeSwitch({ value, onChange, disabled, showLabel = true, className = "" }: TaskTypeSwitchProps) {
   const { t } = useI18n();
   return (
-    <div className={className}>
+    <div className={`min-w-0 ${className}`}>
       {showLabel && <div className="hud mb-1.5 text-[11px] text-primary">{t("cockpit.taskType.label")}</div>}
-      <div className="cockpit-segment inline-flex">
+      {/* `max-w-full flex-wrap`: on a narrow host the control wraps onto two rows
+          instead of overflowing (labels are longer in some locales). */}
+      <div className="cockpit-segment inline-flex max-w-full flex-wrap">
         {OPTIONS.map((option) => {
           const selected = option.value === value;
           const copy = optionCopy(t, option.value);
@@ -64,7 +66,7 @@ export function TaskTypeSwitch({ value, onChange, disabled, showLabel = true, cl
               title={copy.hint}
               aria-pressed={selected}
               onClick={() => onChange(option.value)}
-              className={`cockpit-segment__btn flex items-center gap-1.5 px-3 py-1.5 text-[14px] transition ease-out active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100 ${FOCUS_RING} ${
+              className={`cockpit-segment__btn flex shrink-0 items-center gap-1.5 px-3 py-1.5 text-[14px] transition ease-out active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100 ${FOCUS_RING} ${
                 selected ? "cockpit-segment__btn--active" : ""
               }`}
             >

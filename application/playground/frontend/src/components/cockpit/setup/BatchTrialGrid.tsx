@@ -409,21 +409,21 @@ export function BatchTrialGrid({
       className={`flex h-full min-h-0 w-full flex-col overflow-hidden ${className}`}
     >
       <header className="mb-2 flex shrink-0 flex-wrap items-baseline gap-x-2.5 gap-y-1 border-b border-outline/25 pb-2">
-        <p className="hud text-[11px] text-primary">
+        <p className="hud shrink-0 text-[11px] text-primary">
           {t("cockpitSetup.batch.simulatedCohort")}
         </p>
-        <p className="font-display text-[15px] font-bold tracking-tight text-text-main">
+        <p className="shrink-0 font-display text-[15px] font-bold tracking-tight text-text-main">
           {t("cockpitSetup.batch.peopleCount", { count: trials.length })}
         </p>
         {jobLabel ? (
           <p
-            className="min-w-0 flex-1 truncate font-mono text-[12px] text-text-dim"
+            className="min-w-0 grow basis-full truncate font-mono text-[12px] text-text-dim sm:basis-auto"
             title={jobLabel}
           >
             {jobLabel}
           </p>
         ) : null}
-        <div className="ml-auto flex flex-wrap justify-end gap-1">
+        <div className="flex w-full flex-wrap justify-start gap-1 sm:ml-auto sm:w-auto sm:justify-end">
           {counts.pending > 0 && (
             <CohortStat
               tone="dim"
