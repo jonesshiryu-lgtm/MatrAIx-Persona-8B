@@ -83,6 +83,10 @@ PERSONA_MODEL_KNOB_META: Dict[str, Dict[str, str]] = {
         "label": "DeepSeek V4 Pro",
         "description": "DeepSeek official API flagship.",
     },
+    "deepseek/deepseek-v4-flash": {
+        "label": "DeepSeek V4 Flash",
+        "description": "DeepSeek official API fast, lower-cost tier.",
+    },
     "deepseek/deepseek-chat": {
         "label": "DeepSeek Chat",
         "description": "DeepSeek official API chat alias.",

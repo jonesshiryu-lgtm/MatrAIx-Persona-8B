@@ -140,6 +140,26 @@ export function useSetupPersonaSampling(
     setTaskDefaultStrategyDismissed(record.taskDefaultStrategyDismissed === true);
   }, []);
 
+  // The persona-model list is owned by the backend, but the choice is remembered
+  // per task in localStorage — a model the backend no longer offers would make
+  // the run request fail validation, so re-anchor it once `options` arrives.
+  //
+  // `personaModel` is a dependency on purpose: task hydration re-applies the stored
+  // per-task record *after* the catalog arrives, and that record may hold a model
+  // the backend no longer offers. Re-running is cheap and terminating — when the
+  // value is already offered the updater returns it unchanged, so React bails out
+  // without another render.
+  useEffect(() => {
+    if (!options) return;
+    const offered =
+      options.knobs
+        .find((knob) => knob.key === "personaModel")
+        ?.options.map((option) => option.value) ?? [];
+    const active = options.environment.personaModel;
+    if (offered.length === 0 || !active) return;
+    setPersonaModel((current) => (offered.includes(current) ? current : active));
+  }, [options, personaModel]);
+
   const resetWorkspaceSetup = useCallback(() => {
     const strategy = strategyQuery.data ?? taskPersonaStrategy;
     const base: CockpitPersonaSetupRecord = {
