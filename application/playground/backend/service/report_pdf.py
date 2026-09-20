@@ -984,9 +984,14 @@ def build_batch_report_pdf(
             if not isinstance(trial, dict):
                 continue
             persona = trial.get("personaName") or trial.get("personaId") or "-"
-            status = "done" if trial.get("completed") else "pending"
-            if trial.get("error") or trial.get("succeeded") is False:
+            # ``succeeded`` is tri-state (None while a trial has no result.json
+            # yet), so only a finished trial may be downgraded to failed.
+            if trial.get("error") or (
+                trial.get("completed") and trial.get("succeeded") is False
+            ):
                 status = "failed"
+            else:
+                status = "done" if trial.get("completed") else "pending"
             name = _safe(trial.get("trialName") or "trial", limit=48)
             line = f"{_safe(persona, limit=28)}  {status}  {name}"
             if trial.get("error"):

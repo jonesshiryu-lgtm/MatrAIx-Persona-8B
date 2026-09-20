@@ -13,6 +13,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,13 +91,40 @@ def _default_harbor_runs_root() -> Path:
     )
 
 
-def _run_subprocess(command: Sequence[str], *, cwd: Path, env: Dict[str, str]) -> int:
-    return subprocess.run(
-        list(command),
-        cwd=str(cwd),
-        env=env,
-        check=False,
-    ).returncode
+def _run_subprocess(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    env: Dict[str, str],
+    cancel_event: Optional[threading.Event] = None,
+) -> int:
+    """Run ``command`` to completion, terminating it if ``cancel_event`` is set.
+
+    Most callers pass nothing and keep the plain blocking behaviour. Batch
+    dispatch passes an event so that stopping a cohort ends its worker mid-trial
+    instead of leaving a process behind holding ``trial.log`` open (which makes
+    the job directory undeletable on Windows).
+    """
+    if cancel_event is None:
+        return subprocess.run(
+            list(command),
+            cwd=str(cwd),
+            env=env,
+            check=False,
+        ).returncode
+    process = subprocess.Popen(list(command), cwd=str(cwd), env=env)
+    while True:
+        try:
+            return process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            if not cancel_event.is_set():
+                continue
+            process.terminate()
+            try:
+                return process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return process.wait()
 
 
 def _read_env_file(path: Path) -> Dict[str, str]:

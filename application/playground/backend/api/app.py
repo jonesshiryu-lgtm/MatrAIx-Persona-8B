@@ -924,6 +924,20 @@ def create_app(catalog_path: Optional[str] = None) -> FastAPI:
             status = 404 if "not found" in message.lower() else 400
             raise HTTPException(status_code=status, detail=message) from exc
 
+    @app.post(
+        "/api/harbor/jobs/{job_name}/resume",
+        tags=["harbor-jobs"],
+    )
+    def resume_harbor_job(
+        job_name: str, services: AppState = Depends(get_services)
+    ) -> Dict[str, Any]:
+        try:
+            return services.harbor_jobs.resume_local_distributed(job_name)
+        except ValueError as exc:
+            message = str(exc)
+            status = 404 if "not found" in message.lower() else 400
+            raise HTTPException(status_code=status, detail=message) from exc
+
     @app.get(
         "/api/harbor/jobs/{job_name}/status",
         tags=["harbor-jobs"],

@@ -375,7 +375,10 @@ function contextPriority(context: AggregationContext, category: ReportingCategor
 }
 
 function trialStatus(trial: HarborTrialRow): "done" | "failed" | "running" | "pending" {
-  if (trial.error || trial.succeeded === false) return "failed";
+  // ``succeeded`` is tri-state (null while a trial has no result.json yet), and
+  // older payloads may still send false for unfinished trials — only a
+  // completed trial can be failed.
+  if (trial.error || (trial.completed && trial.succeeded === false)) return "failed";
   if (trial.completed) return "done";
   if (trial.completed === false) return "running";
   return "pending";

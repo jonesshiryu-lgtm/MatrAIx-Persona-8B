@@ -16,6 +16,7 @@ class _FakeHarborJobService:
         self.launches: list[dict[str, Any]] = []
         self.debrief_calls: list[tuple[str, str]] = []
         self.deleted: list[str] = []
+        self.resumed: list[str] = []
         self._jobs: dict[str, dict[str, Any]] = {
             "demo-job": {
                 "jobName": "demo-job",
@@ -47,6 +48,12 @@ class _FakeHarborJobService:
 
     def get_job(self, job_name: str) -> dict[str, Any] | None:
         return self._jobs.get(job_name)
+
+    def resume_local_distributed(self, job_name: str) -> dict[str, Any]:
+        if job_name not in self._jobs:
+            raise ValueError("Job not found: {}".format(job_name))
+        self.resumed.append(job_name)
+        return {"jobName": job_name, "resumed": 3}
 
     def get_job_aggregation(self, job_name: str) -> dict[str, Any]:
         if job_name not in self._jobs:
@@ -171,6 +178,18 @@ def test_delete_harbor_job(client, fake_harbor_jobs):
 
 def test_delete_harbor_job_missing(client, fake_harbor_jobs):
     resp = client.delete("/api/harbor/jobs/missing-job")
+    assert resp.status_code == 404
+
+
+def test_resume_harbor_job(client, fake_harbor_jobs):
+    resp = client.post("/api/harbor/jobs/demo-job/resume")
+    assert resp.status_code == 200
+    assert resp.json() == {"jobName": "demo-job", "resumed": 3}
+    assert fake_harbor_jobs.resumed == ["demo-job"]
+
+
+def test_resume_harbor_job_missing(client, fake_harbor_jobs):
+    resp = client.post("/api/harbor/jobs/missing-job/resume")
     assert resp.status_code == 404
 
 

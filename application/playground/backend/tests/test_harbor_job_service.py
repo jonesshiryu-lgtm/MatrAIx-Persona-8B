@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from backend.service.harbor_job_service import (
     EXTERNAL_RUN_STALE_AFTER_SEC,
     HarborJobService,
@@ -32,10 +34,7 @@ def test_launch_writes_job_config(tmp_path, monkeypatch):
         calls.append({"command": list(command), "cwd": cwd, "env": dict(env)})
         return 0
 
-    monkeypatch.setattr(
-        "playground.harbor.playground._repo_root",
-        lambda: repo,
-    )
+    monkeypatch.setattr("playground.harbor.playground._repo_root", lambda: repo)
     service = HarborJobService(
         repo_root=repo,
         jobs_dir=jobs_dir,
@@ -438,6 +437,381 @@ class _FakeExecutor:
 
     def shutdown(self, wait=False, cancel_futures=True):
         return None
+
+
+def test_local_coordinator_resume_skips_finished_trials(tmp_path):
+    """Resume replays the persisted plan and only re-dispatches pending trials."""
+    from backend.service.local_distributed_harbor import (
+        LocalDistributedHarborCoordinator,
+        pending_trial_count,
+    )
+
+    job_dir = tmp_path / "jobs" / "pg-survey-resume"
+    manifests_dir = job_dir / "_generated" / "distributed_manifests"
+    manifests_dir.mkdir(parents=True)
+    for trial_name in ("trial-done", "trial-pending"):
+        (manifests_dir / "{}.json".format(trial_name)).write_text(
+            json.dumps({"trial_name": trial_name, "task": {"path": "t"}}),
+            encoding="utf-8",
+        )
+    done_dir = job_dir / "trial-done"
+    done_dir.mkdir(parents=True)
+    (done_dir / "result.json").write_text(json.dumps({"reward": 1.0}), encoding="utf-8")
+    assert pending_trial_count(job_dir) == 1
+
+    invoked: list[str] = []
+
+    def _fake_worker(manifest_path, env):
+        invoked.append(manifest_path.name)
+        trial_dir = job_dir / manifest_path.name[: -len(".json")]
+        (trial_dir / "result.json").write_text(json.dumps({"reward": 1.0}), encoding="utf-8")
+        return 0
+
+    coordinator = LocalDistributedHarborCoordinator(
+        repo_root=tmp_path,
+        job_name="pg-survey-resume",
+        job_config={"n_concurrent_trials": 2},
+        launch_env={},
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor", "run"),
+        worker_runner=_fake_worker,
+        resume=True,
+    )
+    summary = coordinator.run()
+
+    assert invoked == ["trial-pending.json"]
+    assert summary["trialCount"] == 2
+    assert summary["resumedTrials"] == 1
+    job_result = json.loads((job_dir / "result.json").read_text(encoding="utf-8"))
+    assert job_result["finished_at"]
+    assert job_result["stats"]["n_completed_trials"] == 2
+    assert pending_trial_count(job_dir) == 0
+
+
+def _interrupted_local_job(repo):
+    """Job dir + launch meta for a local batch whose coordinator died."""
+    jobs_dir = repo / "jobs"
+    job_dir = jobs_dir / "pg-survey-interrupted"
+    manifests_dir = job_dir / "_generated" / "distributed_manifests"
+    manifests_dir.mkdir(parents=True)
+    (manifests_dir / "trial-a.json").write_text(
+        json.dumps({"trial_name": "trial-a", "task": {"path": "t"}}),
+        encoding="utf-8",
+    )
+    configs_dir = repo / "configs" / "jobs" / "application-task-job-recipe"
+    configs_dir.mkdir(parents=True)
+    (configs_dir / "pg-survey-interrupted.launch.json").write_text(
+        json.dumps(
+            {
+                "configPath": "configs/jobs/pg-survey-interrupted.yaml",
+                "executionPlane": "harbor",
+                "computeFamily": "local",
+                "computeEnvironment": "host",
+                "executionMode": "auto",
+                "useLocalDistributed": True,
+                "trialProfile": "json_survey",
+                "surveyTaskPath": "application/tasks/example-survey_product-feedback",
+                "jobConfig": {"n_concurrent_trials": 1, "tasks": [], "agents": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return job_dir, configs_dir
+
+
+def test_resume_local_distributed_replays_launch_meta(tmp_path, monkeypatch):
+    """An interrupted local batch is re-dispatched in place, not re-planned."""
+    repo = tmp_path
+    job_dir, configs_dir = _interrupted_local_job(repo)
+    monkeypatch.setattr("playground.harbor.playground._repo_root", lambda: repo)
+
+    service = HarborJobService(
+        repo_root=repo,
+        jobs_dir=repo / "jobs",
+        generated_configs_dir=configs_dir,
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor"),
+    )
+    service._executor = _FakeExecutor()
+
+    outcome = service.resume_local_distributed("pg-survey-interrupted")
+
+    assert outcome == {"jobName": "pg-survey-interrupted", "resumed": 1}
+    fn, args, kwargs = service._executor.calls[0]
+    assert fn.__name__ == "_run_local_distributed"
+    assert args[0] == "pg-survey-interrupted"
+    assert args[1] == {"n_concurrent_trials": 1, "tasks": [], "agents": []}
+    assert kwargs["resume"] is True
+    assert service._launches["pg-survey-interrupted"].status == "queued"
+
+    # A job this process is already driving cannot be resumed twice.
+    with pytest.raises(ValueError, match="still running"):
+        service.resume_local_distributed("pg-survey-interrupted")
+
+    # Nothing planned but unfinished -> nothing to do.
+    (job_dir / "trial-a").mkdir(parents=True, exist_ok=True)
+    (job_dir / "trial-a" / "result.json").write_text(
+        json.dumps({"reward": 1.0}), encoding="utf-8"
+    )
+    service._launches.clear()
+    assert service.resume_local_distributed("pg-survey-interrupted") == {
+        "jobName": "pg-survey-interrupted",
+        "resumed": 0,
+    }
+    service.shutdown()
+
+
+def test_retry_failed_local_batch_replays_the_persisted_plan(tmp_path, monkeypatch):
+    """A local retry reuses the cohort plan instead of planning a new one.
+
+    Without ``resume=True`` the coordinator would materialize fresh random trial
+    names for every task/agent and re-run the trials that already succeeded.
+    """
+    repo = tmp_path
+    job_dir, configs_dir = _interrupted_local_job(repo)
+    (repo / "configs" / "jobs" / "pg-survey-interrupted.yaml").write_text(
+        "job_name: pg-survey-interrupted\n", encoding="utf-8"
+    )
+    for trial_name, payload in (
+        ("trial-ok", {}),
+        ("trial-fail", {"exception_info": {"exception_message": "boom"}}),
+    ):
+        trial_dir = job_dir / trial_name
+        trial_dir.mkdir(parents=True)
+        (trial_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr("playground.harbor.playground._repo_root", lambda: repo)
+
+    service = HarborJobService(
+        repo_root=repo,
+        jobs_dir=repo / "jobs",
+        generated_configs_dir=configs_dir,
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor"),
+    )
+    service._executor = _FakeExecutor()
+
+    assert service.retry_failed("pg-survey-interrupted") == {
+        "jobName": "pg-survey-interrupted",
+        "retried": 1,
+    }
+
+    fn, args, kwargs = service._executor.calls[0]
+    assert fn.__name__ == "_run_local_distributed"
+    assert args[0] == "pg-survey-interrupted"
+    assert kwargs["resume"] is True
+    # Only the failed trial was removed; the succeeded one must not be re-run.
+    assert (job_dir / "trial-ok").is_dir()
+    assert not (job_dir / "trial-fail").exists()
+    service.shutdown()
+
+
+def test_local_coordinator_cancel_stops_dispatch(tmp_path):
+    """Cancelling during a run stops dispatching and finalizes as cancelled."""
+    from backend.service.local_distributed_harbor import LocalDistributedHarborCoordinator
+
+    job_dir = tmp_path / "jobs" / "pg-survey-cancel"
+    manifests_dir = job_dir / "_generated" / "distributed_manifests"
+    manifests_dir.mkdir(parents=True)
+    for trial_name in ("t-a", "t-b", "t-c"):
+        (manifests_dir / "{}.json".format(trial_name)).write_text(
+            json.dumps({"trial_name": trial_name, "task": {"path": "t"}}),
+            encoding="utf-8",
+        )
+
+    invoked: list[str] = []
+    state: dict[str, object] = {"coordinator": None}
+
+    def _fake_worker(manifest_path, env):
+        invoked.append(manifest_path.name)
+        coordinator = state["coordinator"]
+        assert coordinator is not None
+        coordinator.cancel()
+        trial_dir = job_dir / manifest_path.name[: -len(".json")]
+        (trial_dir / "result.json").write_text(
+            json.dumps({"reward": 1.0}), encoding="utf-8"
+        )
+        return 0
+
+    coordinator = LocalDistributedHarborCoordinator(
+        repo_root=tmp_path,
+        job_name="pg-survey-cancel",
+        job_config={"n_concurrent_trials": 1},
+        launch_env={},
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor", "run"),
+        worker_runner=_fake_worker,
+        resume=True,
+    )
+    state["coordinator"] = coordinator
+    summary = coordinator.run()
+
+    assert invoked == ["t-a.json"]
+    assert summary["cancelled"] is True
+    assert summary["trialCount"] == 3
+    job_result = json.loads((job_dir / "result.json").read_text(encoding="utf-8"))
+    assert job_result["finished_at"]
+    state_file = json.loads(
+        (job_dir / "_generated" / "distributed_state.json").read_text(encoding="utf-8")
+    )
+    assert state_file["status"] == "cancelled"
+
+
+def test_local_coordinator_passes_cancel_event_to_cancel_runner(tmp_path):
+    """The cancellation-aware dispatch path receives the coordinator's event."""
+    from backend.service.local_distributed_harbor import LocalDistributedHarborCoordinator
+
+    job_dir = tmp_path / "jobs" / "pg-survey-cancel-runner"
+    manifests_dir = job_dir / "_generated" / "distributed_manifests"
+    manifests_dir.mkdir(parents=True)
+    (manifests_dir / "t-a.json").write_text(
+        json.dumps({"trial_name": "t-a", "task": {"path": "t"}}),
+        encoding="utf-8",
+    )
+    seen: list[bool] = []
+
+    def _cancel_runner(command, *, cwd, env, cancel_event):
+        seen.append(cancel_event is not None and not cancel_event.is_set())
+        return 0
+
+    LocalDistributedHarborCoordinator(
+        repo_root=tmp_path,
+        job_name="pg-survey-cancel-runner",
+        job_config={
+            "n_concurrent_trials": 1,
+            "tasks": [{"path": "t"}],
+            "agents": [{"name": "agent"}],
+        },
+        launch_env={},
+        command_runner=lambda command, *, cwd, env: 0,
+        cancel_runner=_cancel_runner,
+        harbor_command=("echo", "harbor", "run"),
+    ).run()
+
+    assert seen == [True]
+
+
+def test_delete_job_cancels_the_local_coordinator(tmp_path):
+    """Stop batch must cancel the dispatcher before touching files."""
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / "pg-survey-stop"
+    (job_dir / "trial-a").mkdir(parents=True)
+    (job_dir / "trial-a" / "trial.log").write_text("running", encoding="utf-8")
+
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor"),
+    )
+
+    class _Coordinator:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+            # A real coordinator unregisters itself once its pool drains.
+            service._local_runs.pop("pg-survey-stop", None)
+
+    coordinator = _Coordinator()
+    service._local_runs["pg-survey-stop"] = coordinator
+
+    service.delete_job("pg-survey-stop")
+
+    assert coordinator.cancelled is True
+    assert not job_dir.exists()
+    assert service.get_job("pg-survey-stop") is None
+    service.shutdown()
+
+
+def test_delete_job_reports_a_tree_that_stays_locked(tmp_path, monkeypatch):
+    """A tree that never unlocks is reported, instead of silently surviving."""
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / "pg-survey-locked"
+    (job_dir / "trial-a").mkdir(parents=True)
+    (job_dir / "trial-a" / "trial.log").write_text("locked", encoding="utf-8")
+
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor"),
+    )
+
+    def _locked_rmtree(path, *args, **kwargs):
+        raise PermissionError(32, "The process cannot access the file")
+
+    monkeypatch.setattr(
+        "backend.service.harbor_job_service.shutil.rmtree", _locked_rmtree
+    )
+    monkeypatch.setattr("backend.service.harbor_job_service.time.sleep", lambda _s: None)
+
+    with pytest.raises(ValueError, match="still stopping"):
+        service.delete_job("pg-survey-locked")
+
+    # The job is still listed so the caller can retry once the handle closes.
+    assert job_dir.exists()
+    assert [row["jobName"] for row in service.list_jobs()] == ["pg-survey-locked"]
+    service.shutdown()
+
+
+def test_delete_job_aborts_when_the_coordinator_never_drains(tmp_path, monkeypatch):
+    """A coordinator outliving the drain window blocks the delete.
+
+    Deleting anyway would remove the tree under a live coordinator, which keeps
+    dispatching trials for a job the caller believes is gone.
+    """
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / "pg-survey-stuck"
+    (job_dir / "trial-a").mkdir(parents=True)
+
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor"),
+    )
+
+    class _StuckCoordinator:
+        cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+            # A real coordinator unregisters once its pool drains; this one never does.
+
+    coordinator = _StuckCoordinator()
+    service._local_runs["pg-survey-stuck"] = coordinator
+    monkeypatch.setattr(service, "_await_local_stop", lambda name, timeout=30.0: False)
+
+    with pytest.raises(ValueError, match="still stopping"):
+        service.delete_job("pg-survey-stuck")
+
+    assert coordinator.cancelled is True
+    # Nothing was removed: the caller retries once the batch has drained.
+    assert job_dir.exists()
+    assert service.get_job("pg-survey-stuck") is not None
+    service.shutdown()
+
+
+def test_local_run_is_ignored_when_the_job_was_deleted_while_scheduling(tmp_path):
+    """A task that starts after ``delete_job`` must not recreate the job."""
+    jobs_dir = tmp_path / "jobs"
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor"),
+    )
+
+    # No launch record: ``delete_job`` removed it before this task was scheduled.
+    service._run_local_distributed("pg-survey-deleted", {"n_concurrent_trials": 1})
+
+    assert not (jobs_dir / "pg-survey-deleted").exists()
+    service.shutdown()
 
 
 def test_get_job_surfaces_reporting_queue_status(tmp_path, monkeypatch):
@@ -1380,6 +1754,37 @@ def test_list_jobs_discounts_missing_reward_when_artifacts_exist(tmp_path):
     assert detail is not None
     assert detail["trials"][0]["succeeded"] is True
     assert detail["trials"][0]["error"] is None
+    service.shutdown()
+
+
+def test_job_detail_trial_succeeded_is_tri_state(tmp_path):
+    """Unfinished trials report ``succeeded=None``, never ``False``.
+
+    Consumers read ``succeeded is False`` as "failed" (Runs status badge,
+    report PDF), so a two-state field mislabels every queued or running trial
+    as a failure until its ``result.json`` lands.
+    """
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / "pg-survey-tri-state"
+    (job_dir / "trial-queued").mkdir(parents=True)
+    done_dir = job_dir / "trial-done"
+    done_dir.mkdir()
+    (done_dir / "result.json").write_text(
+        json.dumps({"reward": 1.0}), encoding="utf-8"
+    )
+
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+    )
+    detail = service.get_job("pg-survey-tri-state")
+    assert detail is not None
+    by_name = {trial["trialName"]: trial for trial in detail["trials"]}
+    assert by_name["trial-queued"]["completed"] is False
+    assert by_name["trial-queued"]["succeeded"] is None
+    assert by_name["trial-done"]["completed"] is True
+    assert by_name["trial-done"]["succeeded"] is True
     service.shutdown()
 
 

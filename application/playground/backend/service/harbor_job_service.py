@@ -660,6 +660,9 @@ class HarborJobService:
         )
     )
     _launches: dict[str, HarborLaunchRecord] = field(default_factory=dict)
+    # Live local-distributed coordinators, so stopping a job can cancel the thing
+    # that is actually dispatching trials instead of only deleting files.
+    _local_runs: dict[str, Any] = field(default_factory=dict)
     # Per-job extra launch env (e.g. experiment MATRIX_PARAM_* / EXPERIMENTS_TASK_DIR),
     # merged in _build_harbor_launch_env so each experiment cell's stimulus is injected.
     _extra_launch_env: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -1117,14 +1120,19 @@ class HarborJobService:
         return summaries
 
     def delete_job(self, job_name: str) -> None:
+        """Stop the cohort if this process is driving it, then delete its tree.
+
+        Deleting first and stopping later used to fail on Windows: the running
+        worker holds ``trial.log`` open, so ``rmtree`` raised WinError 32, the
+        launch record survived and the batch happily kept running.
+        """
         _validate_job_name(job_name)
         job_dir = self.jobs_dir / job_name
-        if job_dir.is_dir():
-            shutil.rmtree(job_dir)
-        else:
+        if not job_dir.is_dir():
             with self._guard:
                 if job_name not in self._launches:
                     raise ValueError("Job not found: {}".format(job_name))
+        self._cancel_local_coordinator(job_name)
         with self._guard:
             self._launches.pop(job_name, None)
         with self._status_guard:
@@ -1133,6 +1141,56 @@ class HarborJobService:
         if config_path.is_file():
             config_path.unlink()
         self._launch_meta_path(job_name).unlink(missing_ok=True)
+        self._remove_job_dir(job_name, job_dir)
+
+    def _cancel_local_coordinator(self, job_name: str) -> None:
+        """Cancel this process's coordinator for ``job_name`` and let it drain.
+
+        Raises instead of returning when the coordinator is still registered after
+        the drain timeout: the caller is about to delete the job tree, and a live
+        coordinator would keep dispatching and writing into the directory it just
+        lost.
+        """
+        with self._guard:
+            coordinator = self._local_runs.get(job_name)
+        if coordinator is None:
+            return
+        coordinator.cancel()
+        if not self._await_local_stop(job_name):
+            raise ValueError(
+                "Job is still stopping; retry in a moment: {}".format(job_name)
+            )
+
+    def _await_local_stop(self, job_name: str, timeout: float = 30.0) -> bool:
+        """Wait for the cancelled coordinator to unregister; ``False`` on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._guard:
+                if job_name not in self._local_runs:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _remove_job_dir(self, job_name: str, job_dir: Path) -> None:
+        """Delete the job tree, retrying while a just-cancelled worker releases it.
+
+        :meth:`_cancel_local_coordinator` already terminated the workers, so any
+        remaining lock is a handle that is still closing. If the tree somehow
+        stays locked we report it instead of leaving a half-deleted job behind.
+        """
+        for attempt in range(10):
+            if not job_dir.exists():
+                return
+            try:
+                shutil.rmtree(job_dir)
+                return
+            except OSError:
+                if attempt == 9:
+                    raise ValueError(
+                        "Job is still stopping; retry in a moment: {}".format(job_name)
+                    )
+                time.sleep(0.3)
 
     def get_job(self, job_name: str) -> dict[str, Any] | None:
         job_dir = self.jobs_dir / job_name
@@ -1163,7 +1221,11 @@ class HarborJobService:
                     "personaId": persona_meta.get("persona_id"),
                     "personaName": persona_meta.get("display_name"),
                     "completed": completed,
-                    "succeeded": completed and error is None,
+                    # Tri-state on purpose: consumers (Runs status badge, report
+                    # PDF) read ``succeeded is False`` as "failed", so ``None``
+                    # means "no result.json yet" instead of making every queued
+                    # or running trial look like a failure.
+                    "succeeded": (error is None) if completed else None,
                     "error": error,
                     "result": result,
                     "vncUrl": vnc_url,
@@ -1737,9 +1799,13 @@ class HarborJobService:
         chat_application_context: str | None = None,
         chat_max_turns: int | None = None,
         trial_profile: str | None = None,
+        resume: bool = False,
     ) -> None:
         with self._guard:
-            record = self._launches[job_name]
+            record = self._launches.get(job_name)
+            if record is None:
+                # ``delete_job`` dropped this job before the task was scheduled.
+                return
             record.status = "running"
 
         env = self._build_harbor_launch_env(
@@ -1752,6 +1818,7 @@ class HarborJobService:
             chat_max_turns=chat_max_turns,
             job_name=job_name,
         )
+        coordinator = None
         try:
             from backend.service.local_distributed_harbor import (
                 LocalDistributedHarborCoordinator,
@@ -1763,27 +1830,99 @@ class HarborJobService:
                 job_config=job_config_payload,
                 launch_env=env,
                 command_runner=self.command_runner,
+                # Only the built-in runner can abort an in-flight trial; an
+                # injected runner (tests, embeddings) keeps the plain contract.
+                cancel_runner=(
+                    _run_subprocess if self.command_runner is _run_subprocess else None
+                ),
                 harbor_command=self.harbor_command,
+                resume=resume,
             )
+            with self._guard:
+                # ``delete_job`` drops the launch record *before* it deletes the
+                # tree, so a missing record here means the job was deleted while
+                # this task was being scheduled: dispatching now would recreate a
+                # job the caller believes is gone.
+                if job_name not in self._launches:
+                    return
+                self._local_runs[job_name] = coordinator
             self._run_with_trial_host_scoring(job_name, coordinator.run)
-            status = "completed"
+            status = "cancelled" if coordinator.cancel_event.is_set() else "completed"
             error = None
             exit_code = 0
         except Exception as exc:  # noqa: BLE001
             status = "failed"
             error = str(exc)
             exit_code = 1
+        finally:
+            with self._guard:
+                self._local_runs.pop(job_name, None)
 
         with self._guard:
-            record = self._launches[job_name]
-            record.status = status
-            record.exit_code = exit_code
-            record.error = error
-            record.finished_at = _utc_now()
+            # ``delete_job`` may have dropped the record while the cohort drained.
+            record = self._launches.get(job_name)
+            if record is not None:
+                record.status = status
+                record.exit_code = exit_code
+                record.error = error
+                record.finished_at = _utc_now()
         # Rescue anything the per-trial watcher missed (idempotent).
         self._maybe_run_host_verifier(job_name)
         self._maybe_generate_post_run_feedback(job_name)
         self._maybe_schedule_reporting(job_name, self.jobs_dir / job_name)
+
+    def resume_local_distributed(self, job_name: str) -> dict[str, Any]:
+        """Continue an interrupted local-distributed cohort in place.
+
+        Local batches are driven by an in-process coordinator, so an API restart
+        (or a crash) leaves the remaining trials undispatched forever. Unlike
+        :meth:`retry_failed` this never touches finished trials: it replays the
+        persisted per-trial plan and dispatches only the trials that have no
+        ``result.json`` yet.
+
+        This deliberately mirrors ``harbor job resume`` (which skips trials that
+        already have a ``result.json``); the CLI cannot be reused here because
+        this executor dispatches one ``harbor trials start`` per persisted
+        manifest instead of one ``harbor job run`` per job directory.
+        """
+        _validate_job_name(job_name)
+        job_dir = self.jobs_dir / job_name
+        if not job_dir.is_dir():
+            raise ValueError("Job not found: {}".format(job_name))
+        with self._guard:
+            record = self._launches.get(job_name)
+        if record is not None and record.status in {"queued", "running"}:
+            raise ValueError("Job is still running")
+        meta = self._read_json(self._launch_meta_path(job_name))
+        if not meta or not meta.get("useLocalDistributed"):
+            raise ValueError("Job is not a local batch: {}".format(job_name))
+        job_config = meta.get("jobConfig")
+        if not isinstance(job_config, dict):
+            raise ValueError(
+                "Cannot resume: launch metadata is incomplete for {}".format(job_name)
+            )
+
+        from backend.service.local_distributed_harbor import pending_trial_count
+
+        pending = pending_trial_count(job_dir)
+        if pending <= 0:
+            return {"jobName": job_name, "resumed": 0}
+
+        self._rehydrate_launch_record(job_name, meta)
+        self._executor.submit(
+            self._run_local_distributed,
+            job_name,
+            job_config,
+            meta.get("surveyTaskPath"),
+            meta.get("chatTaskPath"),
+            meta.get("chatDomain"),
+            meta.get("chatApplicationId"),
+            meta.get("chatApplicationContext"),
+            meta.get("chatMaxTurns"),
+            meta.get("trialProfile"),
+            resume=True,
+        )
+        return {"jobName": job_name, "resumed": pending}
 
     def _run_harbor(
         self,
@@ -2878,6 +3017,31 @@ class HarborJobService:
                 count += 1
         return count
 
+    def _rehydrate_launch_record(self, job_name: str, meta: dict[str, Any]) -> None:
+        """Rebuild the in-process launch record from persisted launch meta.
+
+        :meth:`retry_failed` and :meth:`resume_local_distributed` both continue a
+        job whose coordinator died with this API process, so the queued record has
+        to be recreated from the persisted meta before the job can be dispatched
+        again.
+        """
+        extra = meta.get("extraLaunchEnv")
+        with self._guard:
+            self._launches[job_name] = HarborLaunchRecord(
+                job_name=job_name,
+                status="queued",
+                config_path=str(meta.get("configPath") or "") or None,
+                started_at=_utc_now(),
+                execution_plane=str(meta.get("executionPlane") or "harbor"),
+                compute_family=str(meta.get("computeFamily") or "local"),
+                compute_environment=str(meta.get("computeEnvironment") or "host"),
+                compute_dispatch=str(meta.get("computeDispatch") or "") or None,
+            )
+            if isinstance(extra, dict) and extra:
+                self._extra_launch_env[job_name] = {
+                    str(key): str(value) for key, value in extra.items()
+                }
+
     def retry_failed(self, job_name: str) -> dict[str, Any]:
         """Re-run only the failed trials in-place.
 
@@ -2942,26 +3106,13 @@ class HarborJobService:
 
         plane = str(meta.get("executionPlane") or "harbor")
         compute_dispatch = meta.get("computeDispatch")
-        retry_extra_env = {str(k): str(v) for k, v in (meta.get("extraLaunchEnv") or {}).items()}
-        with self._guard:
-            self._launches[job_name] = HarborLaunchRecord(
-                job_name=job_name,
-                status="queued",
-                config_path=config_rel or None,
-                started_at=_utc_now(),
-                execution_plane=plane,
-                compute_family=str(meta.get("computeFamily") or "local"),
-                compute_environment=(
-                    str(meta["computeEnvironment"])
-                    if meta.get("computeEnvironment")
-                    else None
-                ),
-                compute_dispatch=str(compute_dispatch) if compute_dispatch else None,
-            )
-            if retry_extra_env:
-                self._extra_launch_env[job_name] = retry_extra_env
+        self._rehydrate_launch_record(job_name, meta)
 
         if meta.get("useLocalDistributed"):
+            # ``resume=True`` replays the persisted per-trial plan: the trials that
+            # already succeeded stay skipped and only the deleted failures are
+            # dispatched again. Re-planning here would fabricate a new random
+            # cohort and re-run everything, contradicting this method's contract.
             self._executor.submit(
                 self._run_local_distributed,
                 job_name,
@@ -2973,6 +3124,7 @@ class HarborJobService:
                 meta.get("chatApplicationContext"),
                 meta.get("chatMaxTurns"),
                 meta.get("trialProfile"),
+                resume=True,
             )
         else:
             dispatch_kwargs = (

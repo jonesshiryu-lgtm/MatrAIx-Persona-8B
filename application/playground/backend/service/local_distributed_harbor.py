@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -80,6 +81,56 @@ class LocalDistributedTrialManifest:
     config: dict[str, Any]
 
 
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    """Parse ``path`` as a JSON object; ``None`` when missing or malformed."""
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def load_persisted_trial_manifests(job_dir: Path) -> list[LocalDistributedTrialManifest]:
+    """Rebuild the cohort plan written by the first dispatch.
+
+    Trial names are random, so re-planning a job would fabricate a brand-new
+    cohort instead of continuing the existing one. The per-trial manifests under
+    ``_generated/distributed_manifests`` are the durable record of what this job
+    was asked to run, and that is what makes an in-place resume possible.
+    """
+    manifests: list[LocalDistributedTrialManifest] = []
+    for manifest_path in sorted((job_dir / "_generated" / "distributed_manifests").glob("*.json")):
+        config = _read_json_object(manifest_path) or {}
+        trial_name = str(config.get("trial_name") or "").strip()
+        if not trial_name:
+            continue
+        manifests.append(
+            LocalDistributedTrialManifest(
+                trial_name=trial_name,
+                trial_dir=job_dir / trial_name,
+                manifest_path=manifest_path,
+                config=config,
+            )
+        )
+    return manifests
+
+
+def _trial_has_result(manifest: LocalDistributedTrialManifest) -> bool:
+    """A planned trial is finished once its worker wrote ``result.json``."""
+    return (manifest.trial_dir / "result.json").is_file()
+
+
+def pending_trial_count(job_dir: Path) -> int:
+    """Planned trials still missing ``result.json``: 0 means nothing to resume."""
+    return sum(
+        1
+        for manifest in load_persisted_trial_manifests(job_dir)
+        if not _trial_has_result(manifest)
+    )
+
+
 @dataclass
 class LocalDistributedHarborCoordinator:
     repo_root: Path
@@ -89,8 +140,25 @@ class LocalDistributedHarborCoordinator:
     command_runner: Callable[..., int]
     harbor_command: tuple[str, ...]
     worker_runner: Callable[[Path, dict[str, str]], int] | None = None
+    # Optional cancellation-aware dispatch: ``(command, cwd=, env=, cancel_event=)``.
+    # Only the built-in subprocess runner implements it; custom runners keep the
+    # plain blocking ``command_runner`` contract instead of being introspected.
+    cancel_runner: Callable[..., int] | None = None
+    # Continue the cohort planned by the first dispatch (same trial dirs, same
+    # trial names) instead of planning a fresh one. Trials that already wrote
+    # ``result.json`` are left alone — that is Harbor's own resume semantic, and
+    # re-running errored trials stays ``retry_failed``'s job.
+    resume: bool = False
     job_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     started_at: datetime = field(default_factory=_utc_now)
+    # Set by ``cancel()``: stops further dispatch and ends the in-flight worker,
+    # so a stop does not leave a process holding ``trial.log`` inside the tree
+    # the caller is about to delete (WinError 32 on Windows).
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+    def cancel(self) -> None:
+        """Stop dispatching and terminate the worker that is currently running."""
+        self.cancel_event.set()
 
     @property
     def jobs_dir(self) -> Path:
@@ -118,26 +186,50 @@ class LocalDistributedHarborCoordinator:
         self.generated_dir.mkdir(parents=True, exist_ok=True)
         self.manifests_dir.mkdir(parents=True, exist_ok=True)
         (self.job_dir / "config.json").write_text(_json_dump(self.job_config), encoding="utf-8")
-        manifests = self._materialize_trial_manifests()
+        manifests = self._manifests_for_run()
+        pending = [manifest for manifest in manifests if not _trial_has_result(manifest)]
         self._write_state(manifests, status="running", retries=0)
         self._write_job_result(manifests=manifests, retries=0, finished=False)
 
         retries = 0
-        concurrency = int(self.job_config.get("n_concurrent_trials") or 1)
-        max_workers = max(1, min(concurrency, len(manifests)))
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(self._run_manifest_with_retries, manifest): manifest
-                for manifest in manifests
-            }
-            for future in as_completed(futures):
-                retries += int(future.result())
-                self._write_state(manifests, status="running", retries=retries)
-                self._write_job_result(manifests=manifests, retries=retries, finished=False)
+        if pending:
+            concurrency = int(self.job_config.get("n_concurrent_trials") or 1)
+            max_workers = max(1, min(concurrency, len(pending)))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(self._run_manifest_with_retries, manifest): manifest
+                    for manifest in pending
+                }
+                for future in as_completed(futures):
+                    retries += int(future.result())
+                    self._write_state(manifests, status="running", retries=retries)
+                    self._write_job_result(manifests=manifests, retries=retries, finished=False)
 
-        self._write_state(manifests, status="completed", retries=retries)
+        cancelled = self.cancel_event.is_set()
+        self._write_state(
+            manifests,
+            status="cancelled" if cancelled else "completed",
+            retries=retries,
+        )
         self._write_job_result(manifests=manifests, retries=retries, finished=True)
-        return {"trialCount": len(manifests), "retries": retries, "jobDir": str(self.job_dir)}
+        return {
+            "trialCount": len(manifests),
+            "resumedTrials": len(pending),
+            "retries": retries,
+            "cancelled": cancelled,
+            "jobDir": str(self.job_dir),
+        }
+
+    def _manifests_for_run(self) -> list[LocalDistributedTrialManifest]:
+        if self.resume:
+            persisted = load_persisted_trial_manifests(self.job_dir)
+            if persisted:
+                return persisted
+            # Nothing persisted but resume was requested (direct construction, not
+            # the API path which refuses to resume without a plan): planning a
+            # fresh cohort is the only way to have something to run, but the
+            # trial names will differ from the interrupted run.
+        return self._materialize_trial_manifests()
 
     def _materialize_trial_manifests(self) -> list[LocalDistributedTrialManifest]:
         manifests: list[LocalDistributedTrialManifest] = []
@@ -145,7 +237,11 @@ class LocalDistributedHarborCoordinator:
             trial_name = str(trial_config["trial_name"])
             trial_dir = self.job_dir / trial_name
             manifest_path = self.manifests_dir / f"{trial_name}.json"
-            self._prime_trial_dir(trial_dir, trial_config)
+            # Reserve the slot only: the status feed treats a trial dir that has
+            # config.json as running and one without it as still queued, so the
+            # config is written on dispatch (``_run_manifest_with_retries``)
+            # rather than for the whole cohort up front.
+            trial_dir.mkdir(parents=True, exist_ok=True)
             manifest_path.write_text(_json_dump(trial_config), encoding="utf-8")
             manifests.append(
                 LocalDistributedTrialManifest(
@@ -194,22 +290,31 @@ class LocalDistributedHarborCoordinator:
         env["MATRIX_PLAYGROUND_JOB_NAME"] = self.job_name
         if self.worker_runner is not None:
             return int(self.worker_runner(manifest.manifest_path, env))
-        return int(
-            self.command_runner(
-                _trial_worker_command(self.harbor_command, manifest.manifest_path),
-                cwd=self.repo_root,
-                env=env,
+        command = _trial_worker_command(self.harbor_command, manifest.manifest_path)
+        if self.cancel_runner is not None:
+            return int(
+                self.cancel_runner(
+                    command,
+                    cwd=self.repo_root,
+                    env=env,
+                    cancel_event=self.cancel_event,
+                )
             )
-        )
+        return int(self.command_runner(command, cwd=self.repo_root, env=env))
 
     def _run_manifest_with_retries(self, manifest: LocalDistributedTrialManifest) -> int:
         retries = 0
         retry = self.job_config.get("retry") or {}
         max_retries = int(retry.get("max_retries") or 0)
         for attempt in range(max_retries + 1):
+            if self.cancel_event.is_set():
+                return retries
             if attempt > 0:
                 shutil.rmtree(manifest.trial_dir, ignore_errors=True)
-                self._prime_trial_dir(manifest.trial_dir, manifest.config)
+            # Dispatch marker: this thread only runs once the pool has a free
+            # slot, so writing the config here is what promotes the trial from
+            # "queued" to "running" in the cohort status feed.
+            self._prime_trial_dir(manifest.trial_dir, manifest.config)
             exit_code = self._invoke_worker(manifest)
             result = self._read_json(manifest.trial_dir / "result.json")
             if result is None or exit_code != 0:
@@ -237,13 +342,7 @@ class LocalDistributedHarborCoordinator:
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any] | None:
-        if not path.is_file():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            return None
-        return payload if isinstance(payload, dict) else None
+        return _read_json_object(path)
 
     @staticmethod
     def _should_retry_exception(exception_type: str, retry: dict[str, Any]) -> bool:

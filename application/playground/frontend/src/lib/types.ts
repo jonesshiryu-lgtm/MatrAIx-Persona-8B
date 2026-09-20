@@ -573,7 +573,8 @@ export interface HarborTrialView {
   personaId?: string | null;
   personaName?: string | null;
   completed?: boolean;
-  succeeded?: boolean;
+  /** Tri-state: null/undefined while the trial has no result.json yet. */
+  succeeded?: boolean | null;
   error?: string | null;
   result?: Record<string, unknown> | null;
 }
