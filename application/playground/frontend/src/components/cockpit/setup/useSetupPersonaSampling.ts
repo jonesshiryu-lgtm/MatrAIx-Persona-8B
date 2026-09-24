@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
+import { useI18n } from "@/i18n/I18nProvider";
 import { api } from "@/lib/api";
 import { takePersonaHandoff, peekPersonaHandoff } from "@/lib/personaHandoffStorage";
 import { useUrlState } from "@/lib/useUrlState";
 import type { HarborCockpitTaskKind } from "@/lib/harborCockpitMappers";
 import type { ConfigOptionsResponse, PlaygroundPersona, TaskPersonaStrategy } from "@/lib/types";
 import { PERSONA_BENCH_POOL } from "@/lib/types";
-import { personaModelProviderLabel } from "@/lib/personaAgentCatalog";
+import { formatUsdPer1M, personaModelProviderLabel } from "@/lib/personaAgentCatalog";
 
 import {
   defaultPersonaSetup,
@@ -53,6 +54,7 @@ export function useSetupPersonaSampling(
   taskPath: string | null = null,
   isActive = true,
 ) {
+  const { t } = useI18n();
   const fallbackPersonaModel =
     options?.environment.personaModel ?? "anthropic/claude-haiku-4-5";
   const normalizedPath = taskPath?.trim() || null;
@@ -451,11 +453,19 @@ export function useSetupPersonaSampling(
 
   const personaModelKnob = options?.knobs.find((k) => k.key === "personaModel");
   // Grouped by provider in the open menu. Omit summary — descriptions clutter the rail.
+  // `meta` carries the LiteLLM list price per 1M tokens when the backend knows it.
   const personaModelOptions =
     personaModelKnob?.options.map((o) => ({
       value: o.value,
       label: o.label,
-      group: personaModelProviderLabel(o.value),
+      group: o.group ?? personaModelProviderLabel(o.value),
+      meta:
+        o.inputCostPer1M != null && o.outputCostPer1M != null
+          ? t("personaSetup.modelPrice", {
+              input: formatUsdPer1M(o.inputCostPer1M),
+              output: formatUsdPer1M(o.outputCostPer1M),
+            })
+          : undefined,
     })) ?? [{ value: personaModel, label: personaModel }];
 
   const togglePersona = useCallback(

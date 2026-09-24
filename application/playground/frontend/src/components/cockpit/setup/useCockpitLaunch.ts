@@ -20,6 +20,8 @@ export type CockpitLaunchOverrides = Pick<
   HarborLaunchBody,
   | "mode"
   | "agentName"
+  | "cliSubscription"
+  | "reasoningEffort"
   | "chatDomain"
   | "chatApplicationId"
   | "chatApplicationContext"

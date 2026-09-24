@@ -277,6 +277,16 @@ def _llm_proxy_base_url() -> str:
     ).strip()
 
 
+# Explicit output cap in proxy mode: OpenAI-compatible servers (e.g. MLX) can
+# default to ~1k tokens and cut survey JSON mid-object. Only sent to proxies,
+# since newer OpenAI models reject ``max_tokens``.
+PROXY_MAX_OUTPUT_TOKENS = 16_384
+
+
+def _proxy_max_output_tokens() -> int | None:
+    return PROXY_MAX_OUTPUT_TOKENS if _llm_proxy_base_url() else None
+
+
 def _llm_request_timeout_seconds() -> float:
     """Return the configured OpenAI-compatible request timeout."""
     value = os.environ.get("LLM_REQUEST_TIMEOUT_SECONDS")
@@ -301,6 +311,7 @@ def build_json_client(model: str, *, temperature: float = 0.7) -> Any:
                 temperature=temperature,
                 timeout_seconds=timeout_seconds,
                 provider="anthropic",
+                max_output_tokens=_proxy_max_output_tokens(),
             )
         return AnthropicJSONClient(value.split("/", 1)[1], temperature=temperature)
     if value.startswith("dashscope/"):
@@ -369,6 +380,7 @@ def build_json_client(model: str, *, temperature: float = 0.7) -> Any:
             temperature=temperature,
             timeout_seconds=timeout_seconds,
             provider="openai",
+            max_output_tokens=_proxy_max_output_tokens(),
         )
     if value.startswith("gpt-"):
         return OpenAIChatClient(
@@ -376,5 +388,6 @@ def build_json_client(model: str, *, temperature: float = 0.7) -> Any:
             temperature=temperature,
             timeout_seconds=timeout_seconds,
             provider="openai",
+            max_output_tokens=_proxy_max_output_tokens(),
         )
     return AnthropicJSONClient(value, temperature=temperature)

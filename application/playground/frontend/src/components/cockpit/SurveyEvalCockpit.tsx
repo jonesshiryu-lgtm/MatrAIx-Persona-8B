@@ -63,6 +63,7 @@ import { CockpitPipelineDiagram } from "./setup/CockpitPipelineDiagram";
 import { TaskSelectionRail } from "./setup/TaskSelectionRail";
 import { CockpitRunCenter } from "./setup/CockpitRunCenter";
 import { useCockpitLaunch } from "./setup/useCockpitLaunch";
+import { usePersonaAuth } from "./setup/usePersonaAuth";
 import {
   batchProgressPct as computeBatchProgressPct,
   formatBatchProgressLabel,
@@ -267,6 +268,15 @@ export function SurveyEvalCockpit({
     configAnotherOpen,
     batchLaunching,
   } = useCockpitLaunch(options, "survey", setupTaskPath, isActive);
+  const {
+    personaAuth,
+    setPersonaAuth,
+    modelOptions: authModelOptions,
+    launchFields: authLaunchFields,
+    reasoningEffort,
+    setReasoningEffort,
+    reasoningEfforts,
+  } = usePersonaAuth(personaModel, setPersonaModel, personaModelOptions);
   const setupLocked = phase !== "idle" || Boolean(batchJobName);
   const visiblePersonaIds = setupLocked && batchPersonaIds.length > 0 ? batchPersonaIds : selectedPersonaIds;
   // Locked batches must read cards from the launch-time pool (cohort path);
@@ -372,6 +382,7 @@ export function SurveyEvalCockpit({
         personaId: persona.id,
         personaModel,
         mode: "auto",
+        ...authLaunchFields,
         mapDebrief: (debrief, ctx) =>
           mapSurveyDebriefToJobView(debrief, ctx, {
             personaId: persona.id,
@@ -388,7 +399,7 @@ export function SurveyEvalCockpit({
           }),
       });
     },
-    [persona, isRunning, run, personaModel, harborTasks],
+    [persona, isRunning, run, personaModel, harborTasks, authLaunchFields],
   );
 
   const handleRun = useCallback(() => {
@@ -404,11 +415,20 @@ export function SurveyEvalCockpit({
       await launchBatch({
         taskPath: selectedCard.taskPath || HARBOR_TASK_PATHS.survey,
         taskId: selectedCard.id,
+        overrides: authLaunchFields,
       });
       return;
     }
     handleRun();
-  }, [canLaunchCohort, selectedCard, isRunning, isBatchRun, launchBatch, handleRun]);
+  }, [
+    canLaunchCohort,
+    selectedCard,
+    isRunning,
+    isBatchRun,
+    launchBatch,
+    handleRun,
+    authLaunchFields,
+  ]);
 
   const handleNewRun = useCallback(() => {
     reset();
@@ -557,7 +577,12 @@ export function SurveyEvalCockpit({
           taskPath={activeTaskPath || null}
           personaModel={personaModel}
           onPersonaModelChange={setPersonaModel}
-          personaModelOptions={personaModelOptions}
+          personaModelOptions={authModelOptions}
+          personaAuth={personaAuth}
+          onPersonaAuthChange={setPersonaAuth}
+          reasoningEffort={reasoningEffort}
+          reasoningEffortOptions={reasoningEfforts}
+          onReasoningEffortChange={setReasoningEffort}
           mode={samplingMode}
           onModeChange={setSamplingMode}
           selectedPersonaIds={visiblePersonaIds}

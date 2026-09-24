@@ -17,7 +17,11 @@ The module imports only the stdlib so it is safe to import anywhere.
 
 from __future__ import annotations
 
+import functools
+import json
 import os
+import re
+import urllib.request
 from typing import Dict, List, Optional
 
 PERSONA_MODEL_ENV = "MATRIX_PERSONA_MODEL"
@@ -39,6 +43,10 @@ PERSONA_MODEL_KNOB_META: Dict[str, Dict[str, str]] = {
         "label": "Claude Sonnet 4.6",
         "description": "Stronger persona simulation at higher cost.",
     },
+    "anthropic/claude-sonnet-5": {
+        "label": "Claude Sonnet 5",
+        "description": "Latest Sonnet persona simulation.",
+    },
     "anthropic/claude-opus-4-8": {
         "label": "Claude Opus 4.8",
         "description": "Highest-capability Claude persona simulation; highest cost.",
@@ -58,6 +66,14 @@ PERSONA_MODEL_KNOB_META: Dict[str, Dict[str, str]] = {
     "openai/gpt-5.5": {
         "label": "GPT-5.5",
         "description": "OpenAI computer-use CUA (default OpenAI desktop CUA model).",
+    },
+    "openai/gpt-6-sol": {
+        "label": "GPT-6 Sol",
+        "description": "Latest OpenAI persona simulation.",
+    },
+    "openai/gpt-6-luna": {
+        "label": "GPT-6 Luna",
+        "description": "Lower-cost GPT-6 persona simulation.",
     },
     "gemini/gemini-2.5-flash": {
         "label": "Gemini 2.5 Flash",
@@ -166,6 +182,76 @@ PERSONA_MODEL_KNOB_META: Dict[str, Dict[str, str]] = {
 }
 
 PERSONA_MODEL_OPTIONS = list(PERSONA_MODEL_KNOB_META.keys())
+
+
+# Proxy entries that are not chat models (embeddings, speech, rerankers).
+_NON_CHAT_MODEL = re.compile(r"whisper|bge|embed|rerank|tts", re.IGNORECASE)
+OPENAI_PROXY_GROUP = "OpenAI-compatible"
+_PROXY_MODELS_CACHE: Dict[tuple[str, str], tuple[str, ...]] = {}
+
+
+def _fetch_proxy_model_ids(base_url: str, api_key: str) -> List[str]:
+    request = urllib.request.Request(
+        "{}/models".format(base_url),
+        headers={
+            "Authorization": "Bearer {}".format(api_key),
+            # Proxies behind bot filters 403 the default Python-urllib agent.
+            "User-Agent": "matraix-playground",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.load(response)
+    return [
+        str(item["id"])
+        for item in payload.get("data", [])
+        if isinstance(item, dict) and item.get("id")
+    ]
+
+
+def openai_proxy_persona_models() -> tuple[str, ...]:
+    """Chat models served by an ``OPENAI_BASE_URL`` proxy, as ``openai/<id>``.
+
+    Proxy mode (see ``playground.model_client``) routes ``openai/*`` persona
+    calls to that endpoint, so its own model ids become selectable. Empty when
+    no proxy is configured or its model list cannot be read; a successful
+    listing is cached for the process (restart the backend to refresh).
+    """
+    base_url = (
+        os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or ""
+    ).strip().rstrip("/")
+    if not base_url:
+        return ()
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    cached = _PROXY_MODELS_CACHE.get((base_url, api_key))
+    if cached is not None:
+        return cached
+    try:
+        model_ids = _fetch_proxy_model_ids(base_url, api_key)
+    except Exception:
+        return ()
+    models = tuple(
+        "openai/{}".format(model_id)
+        for model_id in model_ids
+        if not _NON_CHAT_MODEL.search(model_id)
+    )
+    _PROXY_MODELS_CACHE[(base_url, api_key)] = models
+    return models
+
+
+@functools.lru_cache(maxsize=None)
+def persona_model_price_per_1m(model: str) -> tuple[float, float] | None:
+    """LiteLLM list price in USD per 1M (input, output) tokens; None when unknown."""
+    try:
+        from litellm.utils import get_model_info
+
+        info = get_model_info(model)
+    except Exception:
+        return None
+    input_cost = info.get("input_cost_per_token")
+    output_cost = info.get("output_cost_per_token")
+    if input_cost is None or output_cost is None:
+        return None
+    return round(input_cost * 1_000_000, 4), round(output_cost * 1_000_000, 4)
 DEFAULT_HARBOR_PERSONA_MODEL = DEFAULT_PERSONA_MODEL
 HARBOR_PERSONA_MODEL_OPTIONS = PERSONA_MODEL_OPTIONS
 RUNTIME_OPTIONS = ("local", "harbor")
@@ -440,7 +526,7 @@ class ConfigManager:
             meta = self.KNOB_META.get(key, {})
             value_meta = meta.get("values", {})
             value_meta = value_meta if isinstance(value_meta, dict) else {}
-            option_views: List[Dict[str, str]] = []
+            option_views: List[Dict[str, object]] = []
             allowed_values = (
                 PERSONA_MODEL_OPTIONS
                 if key == "personaModel"
@@ -449,11 +535,25 @@ class ConfigManager:
             for value in allowed_values:
                 vm = value_meta.get(value, {})
                 vm = vm if isinstance(vm, dict) else {}
+                view: Dict[str, object] = {
+                    "value": value,
+                    "label": str(vm.get("label", value)),
+                    "description": str(vm.get("description", "")),
+                }
+                price = persona_model_price_per_1m(value) if key == "personaModel" else None
+                if price is not None:
+                    view["inputCostPer1M"], view["outputCostPer1M"] = price
+                option_views.append(view)
+            proxy_models = openai_proxy_persona_models() if key == "personaModel" else ()
+            for value in proxy_models:
+                if value in allowed_values:
+                    continue
                 option_views.append(
                     {
                         "value": value,
-                        "label": str(vm.get("label", value)),
-                        "description": str(vm.get("description", "")),
+                        "label": value.split("/", 1)[1],
+                        "description": "Served by the OpenAI-compatible proxy.",
+                        "group": OPENAI_PROXY_GROUP,
                     }
                 )
             knobs.append(

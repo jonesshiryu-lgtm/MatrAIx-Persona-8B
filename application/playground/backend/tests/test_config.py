@@ -2,7 +2,59 @@
 
 from __future__ import annotations
 
+from backend.service import config as config_module
 from backend.service.config import PERSONA_MODEL_OPTIONS
+
+
+def test_options_list_openai_proxy_chat_models(config_manager, monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.example/v1")
+    monkeypatch.setattr(config_module, "_PROXY_MODELS_CACHE", {})
+    monkeypatch.setattr(
+        config_module,
+        "_fetch_proxy_model_ids",
+        lambda base, key: ["qwen3:8b", "[MLX] qwen3.5-122b", "bge-m3:latest", "[MLX] whisper-large-v3-turbo"],
+    )
+    knobs = {k["key"]: k for k in config_manager.options()["knobs"]}
+    proxy = {o["value"]: o for o in knobs["personaModel"]["options"] if o.get("group")}
+    assert list(proxy) == ["openai/qwen3:8b", "openai/[MLX] qwen3.5-122b"]
+    assert proxy["openai/qwen3:8b"]["label"] == "qwen3:8b"
+    assert proxy["openai/qwen3:8b"]["group"] == "OpenAI-compatible"
+
+
+def test_fetch_proxy_model_ids_sends_user_agent(monkeypatch):
+    # Some proxies (e.g. behind Cloudflare) 403 the default Python-urllib agent.
+    seen = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"data": [{"id": "qwen3:8b"}]}'
+
+    def _fake_urlopen(request, timeout):
+        seen["user_agent"] = request.get_header("User-agent")
+        seen["authorization"] = request.get_header("Authorization")
+        return _Response()
+
+    monkeypatch.setattr(config_module.urllib.request, "urlopen", _fake_urlopen)
+    assert config_module._fetch_proxy_model_ids("https://proxy.example/v1", "k") == ["qwen3:8b"]
+    assert seen["user_agent"] and "urllib" not in seen["user_agent"].lower()
+    assert seen["authorization"] == "Bearer k"
+
+
+def test_options_skip_proxy_models_without_base_url(config_manager, monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.setattr(config_module, "_PROXY_MODELS_CACHE", {})
+    monkeypatch.setattr(
+        config_module, "_fetch_proxy_model_ids", lambda base, key: ["qwen3:8b"]
+    )
+    knobs = {k["key"]: k for k in config_manager.options()["knobs"]}
+    assert "openai/qwen3:8b" not in [o["value"] for o in knobs["personaModel"]["options"]]
 
 
 def test_domain_allows_all_three(config_manager):
@@ -65,6 +117,13 @@ def test_options_knob_values_match_allowed(config_manager):
         assert values == config_manager.ALLOWED[key]
     assert [o["value"] for o in knobs["personaModel"]["options"]] == PERSONA_MODEL_OPTIONS
     assert "anthropic/claude-opus-4-8" in PERSONA_MODEL_OPTIONS
+    assert "anthropic/claude-sonnet-5" in PERSONA_MODEL_OPTIONS
+    assert "openai/gpt-6-sol" in PERSONA_MODEL_OPTIONS
+    assert "openai/gpt-6-luna" in PERSONA_MODEL_OPTIONS
+    prices = {o["value"]: o for o in knobs["personaModel"]["options"]}
+    assert prices["anthropic/claude-sonnet-5"]["inputCostPer1M"] == 2
+    assert prices["anthropic/claude-sonnet-5"]["outputCostPer1M"] == 10
+    assert prices["openai/gpt-5.5"]["inputCostPer1M"] == 5
     assert "dashscope/qwen3.7-max" in PERSONA_MODEL_OPTIONS
     assert "dashscope/deepseek-v4-pro" in PERSONA_MODEL_OPTIONS
     assert "openrouter/z-ai/glm-4.7" in PERSONA_MODEL_OPTIONS

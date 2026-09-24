@@ -61,11 +61,13 @@ class OpenAIChatClient:
         temperature: float = 0.7,
         timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         provider: str = "openai",
+        max_output_tokens: Optional[int] = None,
     ) -> None:
         self.model = model
         self.temperature = temperature
         self.timeout_seconds = timeout_seconds
         self.provider = provider
+        self.max_output_tokens = max_output_tokens
         if client is None:
             from openai import OpenAI  # lazy: tests inject a fake
 
@@ -89,9 +91,13 @@ class OpenAIChatClient:
                 {"role": "user", "content": user},
             ],
             "timeout": self.timeout_seconds,
+            # Explicit: some OpenAI-compatible proxies stream (SSE) when `stream` is omitted.
+            "stream": False,
         }
         if openai_model_supports_custom_temperature(self.model):
             kwargs["temperature"] = self.temperature
+        if self.max_output_tokens is not None:
+            kwargs["max_tokens"] = self.max_output_tokens
         completion = self._client.chat.completions.create(**kwargs)
         data = coerce_json(completion.choices[0].message.content)
         usage = usage_from_openai_completion(

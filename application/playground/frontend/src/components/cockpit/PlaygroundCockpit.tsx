@@ -47,6 +47,7 @@ import {
   resolveRunLaunchPhase,
 } from "./setup/useCockpitBatchJob";
 import { useCockpitLaunch } from "./setup/useCockpitLaunch";
+import { usePersonaAuth } from "./setup/usePersonaAuth";
 import { useCockpitRunCancel } from "./setup/useCockpitRunCancel";
 import { useCockpitSetupLock } from "./setup/useCockpitSetupLock";
 import { api } from "@/lib/api";
@@ -377,6 +378,15 @@ function ChatbotEvalCockpit({
     configAnotherOpen,
     batchLaunching,
   } = useCockpitLaunch(options, "chatbot", setupTaskPath, isActive);
+  const {
+    personaAuth,
+    setPersonaAuth,
+    modelOptions: authModelOptions,
+    launchFields: authLaunchFields,
+    reasoningEffort,
+    setReasoningEffort,
+    reasoningEfforts,
+  } = usePersonaAuth(personaModel, setPersonaModel, personaModelOptions);
   const pipelinePersonaModelLabel = useMemo(
     () => personaModelPipelineLabel(personaModel, personaModelOptions),
     [personaModel, personaModelOptions],
@@ -536,6 +546,7 @@ function ChatbotEvalCockpit({
       personaId: persona.id,
       personaModel,
       mode: "auto",
+      ...authLaunchFields,
       chatDomain: requestDomain,
       chatApplicationId: knownLaunchApplicationId ?? undefined,
       chatApplicationContext: launchChatApplicationContext,
@@ -568,6 +579,7 @@ function ChatbotEvalCockpit({
     maxTurns,
     phase,
     reset,
+    authLaunchFields,
   ]);
 
   const handleLaunch = useCallback(async () => {
@@ -579,6 +591,7 @@ function ChatbotEvalCockpit({
         taskPath: chatTaskPath,
         taskId: selectedTask.id,
         overrides: {
+          ...authLaunchFields,
           chatDomain: requestDomain,
           chatApplicationId: knownLaunchApplicationId ?? undefined,
           chatApplicationContext: launchChatApplicationContext,
@@ -600,6 +613,7 @@ function ChatbotEvalCockpit({
     selectedTask,
     launchBatch,
     handleRun,
+    authLaunchFields,
   ]);
 
   const handleRetry = useCallback(() => {
@@ -850,7 +864,12 @@ function ChatbotEvalCockpit({
           taskPath={chatTaskPath || null}
           personaModel={personaModel}
           onPersonaModelChange={setPersonaModel}
-          personaModelOptions={personaModelOptions}
+          personaModelOptions={authModelOptions}
+          personaAuth={personaAuth}
+          onPersonaAuthChange={setPersonaAuth}
+          reasoningEffort={reasoningEffort}
+          reasoningEffortOptions={reasoningEfforts}
+          onReasoningEffortChange={setReasoningEffort}
           mode={samplingMode}
           onModeChange={setSamplingMode}
           selectedPersonaIds={visiblePersonaIds}

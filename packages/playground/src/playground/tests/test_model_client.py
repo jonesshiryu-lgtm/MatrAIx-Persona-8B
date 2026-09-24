@@ -345,3 +345,25 @@ def test_build_json_client_requires_zai_key(monkeypatch):
     monkeypatch.delenv("ZAI_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="ZAI_API_KEY"):
         build_json_client("zai/glm-5")
+
+
+def test_build_json_client_caps_output_through_openai_proxy(monkeypatch):
+    # Proxies such as MLX servers default to a short cap and truncate JSON.
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proxy-test")
+    monkeypatch.setattr("openai.OpenAI", _FakeOpenAI)
+
+    client = build_json_client("openai/qwen3:8b")
+    assert isinstance(client, OpenAIChatClient)
+    assert client.model == "qwen3:8b"
+    assert client.max_output_tokens == 16_384
+
+
+def test_build_json_client_leaves_output_uncapped_without_proxy(monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
+    monkeypatch.setattr("openai.OpenAI", _FakeOpenAI)
+
+    client = build_json_client("openai/gpt-5.5")
+    assert client.max_output_tokens is None

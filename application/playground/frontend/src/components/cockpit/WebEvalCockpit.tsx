@@ -59,6 +59,7 @@ import { CockpitPipelineDiagram } from "./setup/CockpitPipelineDiagram";
 import { TaskSelectionRail } from "./setup/TaskSelectionRail";
 import { CockpitRunCenter } from "./setup/CockpitRunCenter";
 import { useCockpitLaunch } from "./setup/useCockpitLaunch";
+import { usePersonaAuth } from "./setup/usePersonaAuth";
 import {
   batchProgressPct as computeBatchProgressPct,
   formatBatchProgressLabel,
@@ -223,7 +224,17 @@ export function WebEvalCockpit({
     configAnotherOpen,
     batchLaunching,
   } = useCockpitLaunch(options, "web", setupTaskPath, isActive);
-
+  const {
+    personaAuth,
+    setPersonaAuth,
+    modelOptions: authModelOptions,
+    launchFields: authLaunchFields,
+    reasoningEffort,
+    setReasoningEffort,
+    reasoningEfforts,
+  } = usePersonaAuth(personaModel, setPersonaModel, personaModelOptions);
+  // A subscription can only bill its own CLI harness, so it overrides the per-task agent.
+  const subscriptionAgent = authLaunchFields.agentName ?? null;
 
   const { setupLocked, visiblePersonaIds } = useCockpitSetupLock(
     phase,
@@ -246,15 +257,20 @@ export function WebEvalCockpit({
   }, [batchTaskId, urlState.pgTaskId]);
 
   const resolveWebAgent = useCallback(
-    (id: string) => webAgentByTaskId[id] ?? suggestedWebPersonaAgent(id),
-    [webAgentByTaskId],
+    (id: string) => subscriptionAgent ?? webAgentByTaskId[id] ?? suggestedWebPersonaAgent(id),
+    [subscriptionAgent, webAgentByTaskId],
   );
-  const activeWebAgent = task ? resolveWebAgent(task.id) : WEB_PERSONA_AGENTS[0].value;
+  const activeWebAgent = task
+    ? resolveWebAgent(task.id)
+    : subscriptionAgent ?? WEB_PERSONA_AGENTS[0].value;
   const activeWebAgentFamily = webAgentFamily(activeWebAgent);
 
   const webPersonaModelOptions = useMemo(
-    () => webPersonaModelSelectOptions(activeWebAgent, personaModelOptions),
-    [activeWebAgent, personaModelOptions],
+    () =>
+      subscriptionAgent
+        ? authModelOptions
+        : webPersonaModelSelectOptions(activeWebAgent, personaModelOptions),
+    [subscriptionAgent, authModelOptions, activeWebAgent, personaModelOptions],
   );
 
   const pipelinePersonaModelLabel = useMemo(
@@ -344,6 +360,7 @@ export function WebEvalCockpit({
       personaModel,
       agentName: activeWebAgent,
       mode: "auto",
+      ...authLaunchFields,
       mapDebrief: (debrief, ctx) =>
         mapWebDebriefToJobView(debrief, ctx, {
           personaId: persona.id,
@@ -352,7 +369,7 @@ export function WebEvalCockpit({
           taskTitle: task.title,
         }),
     });
-  }, [persona, task, isRunning, run, personaModel, activeWebAgent]);
+  }, [persona, task, isRunning, run, personaModel, activeWebAgent, authLaunchFields]);
   const handleLaunch = useCallback(async () => {
     if (!canLaunchCohort || !task?.taskPath || isRunning) {
       return;
@@ -361,12 +378,21 @@ export function WebEvalCockpit({
       await launchBatch({
         taskPath: task.taskPath,
         taskId: task.id,
-        overrides: { agentName: activeWebAgent },
+        overrides: { agentName: activeWebAgent, ...authLaunchFields },
       });
       return;
     }
     handleRun();
-  }, [canLaunchCohort, task, isRunning, isBatchRun, activeWebAgent, launchBatch, handleRun]);
+  }, [
+    canLaunchCohort,
+    task,
+    isRunning,
+    isBatchRun,
+    activeWebAgent,
+    authLaunchFields,
+    launchBatch,
+    handleRun,
+  ]);
 
   const handleNewRun = useCallback(() => {
     reset();
@@ -505,6 +531,11 @@ export function WebEvalCockpit({
           personaModel={personaModel}
           onPersonaModelChange={setPersonaModel}
           personaModelOptions={webPersonaModelOptions}
+          personaAuth={personaAuth}
+          onPersonaAuthChange={setPersonaAuth}
+          reasoningEffort={reasoningEffort}
+          reasoningEffortOptions={reasoningEfforts}
+          onReasoningEffortChange={setReasoningEffort}
           mode={samplingMode}
           onModeChange={setSamplingMode}
           selectedPersonaIds={visiblePersonaIds}
@@ -660,9 +691,11 @@ export function WebEvalCockpit({
           maxTurns={8}
           onMaxTurnsChange={() => undefined}
           resolveWebPersonaAgent={resolveWebAgent}
-          onWebPersonaAgentChange={(id, agent) =>
-            setWebAgentByTaskId((prev) => ({ ...prev, [id]: agent }))
-          }
+          onWebPersonaAgentChange={(id, agent) => {
+            setWebAgentByTaskId((prev) => ({ ...prev, [id]: agent }));
+            // Picking another agent leaves the subscription, which cannot bill it.
+            if (subscriptionAgent && agent !== subscriptionAgent) setPersonaAuth("api");
+          }}
           tasksLoading={tasksQuery.isLoading}
           tasksError={
             tasks.length === 0

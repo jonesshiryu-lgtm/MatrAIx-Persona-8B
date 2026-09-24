@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from backend.service.config import PERSONA_MODEL_OPTIONS
+from backend.service.config import PERSONA_MODEL_OPTIONS, openai_proxy_persona_models
 
 __all__ = [
     "HealthResponse",
@@ -95,6 +95,8 @@ DEFAULT_APPLICATION_CONTEXTS = {
 }
 
 SUPPORTED_PERSONA_MODELS = tuple(PERSONA_MODEL_OPTIONS)
+# Union of the efforts Codex offers across models; the UI narrows per model.
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 
 
 def _resolved_chat_context(
@@ -719,6 +721,11 @@ class HarborJobLaunchRequest(BaseModel):
     cohortId: Optional[str] = None
     useEntirePool: bool = False
     agentName: Optional[str] = None
+    # Bill the host's CLI subscription (persona-claude-code / persona-codex)
+    # instead of the provider API key.
+    cliSubscription: bool = False
+    # persona-codex model_reasoning_effort; the agent defaults to "high".
+    reasoningEffort: Optional[str] = None
     personaModel: Optional[str] = None
     nConcurrentTrials: int = 2
     mode: str = "auto"
@@ -766,12 +773,21 @@ class HarborJobLaunchRequest(BaseModel):
             raise ValueError("computeFamily must be one of local, modal, gcp")
         return normalized
 
+    @field_validator("reasoningEffort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if value not in REASONING_EFFORTS:
+            raise ValueError("reasoningEffort must be one of {}".format(list(REASONING_EFFORTS)))
+        return value
+
     @field_validator("personaModel")
     @classmethod
     def _validate_persona_model(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return value
-        if value not in SUPPORTED_PERSONA_MODELS:
+        if value not in SUPPORTED_PERSONA_MODELS and value not in openai_proxy_persona_models():
             raise ValueError(
                 "personaModel must be one of {}".format(list(SUPPORTED_PERSONA_MODELS))
             )

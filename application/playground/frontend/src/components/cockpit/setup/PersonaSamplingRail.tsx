@@ -31,6 +31,7 @@ import {
 } from "@/lib/personaPoolCopy";
 import { syntheticDisplayName } from "@/lib/personaDisplay";
 import { useDimensionLabels } from "@/lib/dimensionLabels";
+import type { PersonaAuth } from "@/lib/personaAgentCatalog";
 import { FOCUS_RING, Sym, humanizeToken } from "../cockpitShared";
 import { CockpitSelect, type CockpitSelectOption } from "./CockpitSelect";
 import { CockpitToggle } from "./CockpitToggle";
@@ -859,6 +860,13 @@ export interface PersonaSamplingRailProps {
   personaModel: string;
   onPersonaModelChange: (model: string) => void;
   personaModelOptions: CockpitSelectOption[];
+  /** Persona billing: provider API key or a host CLI subscription (Claude Code / Codex). */
+  personaAuth?: PersonaAuth;
+  onPersonaAuthChange?: (auth: PersonaAuth) => void;
+  /** Codex reasoning effort; the picker shows only when `reasoningEffortOptions` is non-empty. */
+  reasoningEffort?: string;
+  reasoningEffortOptions?: string[];
+  onReasoningEffortChange?: (effort: string) => void;
   mode: PersonaSamplingMode;
   onModeChange: (mode: PersonaSamplingMode) => void;
   selectedPersonaIds: string[];
@@ -898,6 +906,11 @@ export function PersonaSamplingRail({
   personaModel,
   onPersonaModelChange,
   personaModelOptions,
+  personaAuth = "api",
+  onPersonaAuthChange,
+  reasoningEffort = "",
+  reasoningEffortOptions = [],
+  onReasoningEffortChange,
   mode,
   onModeChange,
   selectedPersonaIds,
@@ -1774,8 +1787,42 @@ export function PersonaSamplingRail({
                   options={personaModelOptions}
                   disabled={disabled}
                   wideMenu
-                  showSelectedMeta={false}
                   onChange={onPersonaModelChange}
+                />
+              )}
+              {showModelSelector && onPersonaAuthChange && (
+                <CockpitSelect
+                  label={t("personaSetup.auth")}
+                  inlineLabel
+                  labelClassName="w-[4.25rem]"
+                  value={personaAuth}
+                  options={[
+                    { value: "api", label: t("personaSetup.auth.api") },
+                    {
+                      value: "claude-code",
+                      label: t("personaSetup.auth.claudeCode"),
+                      summary: t("personaSetup.auth.claudeCodeHint"),
+                    },
+                    {
+                      value: "codex",
+                      label: t("personaSetup.auth.codex"),
+                      summary: t("personaSetup.auth.codexHint"),
+                    },
+                  ]}
+                  disabled={disabled}
+                  wideMenu
+                  onChange={(value) => onPersonaAuthChange(value as PersonaAuth)}
+                />
+              )}
+              {showModelSelector && onReasoningEffortChange && reasoningEffortOptions.length > 0 && (
+                <CockpitSelect
+                  label={t("personaSetup.reasoningEffort")}
+                  inlineLabel
+                  labelClassName="w-[4.25rem]"
+                  value={reasoningEffort}
+                  options={reasoningEffortOptions.map((effort) => ({ value: effort, label: effort }))}
+                  disabled={disabled}
+                  onChange={onReasoningEffortChange}
                 />
               )}
             </div>

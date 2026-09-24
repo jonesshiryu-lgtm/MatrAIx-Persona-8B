@@ -669,6 +669,49 @@ def test_launch_docker_cua_injects_max_turns_not_max_steps(tmp_path, monkeypatch
     service.shutdown()
 
 
+def test_launch_passes_reasoning_effort_to_agent_kwargs(tmp_path, monkeypatch):
+    repo = tmp_path
+    jobs_dir = repo / "jobs"
+    jobs_dir.mkdir()
+    pool = repo / "persona" / "datasets" / "matraix-persona-dev-sample"
+    pool.mkdir(parents=True)
+    (pool / "persona_0020.yaml").write_text(
+        "persona_id: '0020'\nversion: '1.0'\nsource: OASIS\ndimensions: {}\n",
+        encoding="utf-8",
+    )
+    task_dir = repo / "application" / "tasks" / "example-survey_product-feedback"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.toml").write_text("metadata:\n  type: survey\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "playground.harbor.playground._repo_root",
+        lambda: repo,
+    )
+    service = HarborJobService(
+        repo_root=repo,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=repo / "configs" / "jobs" / "application-task-job-recipe",
+        command_runner=lambda command, *, cwd, env: 0,
+        harbor_command=("echo", "harbor"),
+    )
+
+    service.launch(
+        task_path="application/tasks/example-survey_product-feedback",
+        persona_ids=["0020"],
+        agent_name="persona-codex",
+        persona_model="openai/gpt-6-sol",
+        execution_mode="force_docker",
+        reasoning_effort="xhigh",
+        job_name="codex-effort-job",
+    )
+    text = (
+        repo / "configs" / "jobs" / "application-task-job-recipe" / "codex-effort-job.yaml"
+    ).read_text(encoding="utf-8")
+    assert "name: persona-codex" in text
+    assert "reasoning_effort: xhigh" in text
+    service.shutdown()
+
+
 def test_run_harbor_passes_yes_to_skip_host_env_prompt(tmp_path):
     repo = tmp_path
     jobs_dir = repo / "jobs"

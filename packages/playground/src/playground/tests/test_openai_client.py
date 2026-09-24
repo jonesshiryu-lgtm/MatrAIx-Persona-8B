@@ -63,6 +63,22 @@ def test_complete_json_parses_and_requests_json_mode():
     assert kw["messages"][0]["role"] == "system" and kw["messages"][1]["role"] == "user"
 
 
+def test_complete_json_requests_non_streaming_explicitly():
+    # Some OpenAI-compatible proxies stream (SSE) unless `stream` is false.
+    fake = _FakeOpenAI('{"ok": true}')
+    client = OpenAIChatClient(model="qwen3:8b", client=fake)
+    assert client.complete_json("sys", "user") == {"ok": True}
+    assert fake.chat.completions.last_kwargs["stream"] is False
+    assert "max_tokens" not in fake.chat.completions.last_kwargs
+
+
+def test_complete_json_sends_max_tokens_when_capped():
+    fake = _FakeOpenAI('{"ok": true}')
+    client = OpenAIChatClient(model="qwen3:8b", client=fake, max_output_tokens=16_384)
+    assert client.complete_json("sys", "user") == {"ok": True}
+    assert fake.chat.completions.last_kwargs["max_tokens"] == 16_384
+
+
 def test_complete_json_omits_temperature_for_gpt5():
     fake = _FakeOpenAI('{"ok": true}')
     client = OpenAIChatClient(model="gpt-5.5", client=fake, temperature=0.1)

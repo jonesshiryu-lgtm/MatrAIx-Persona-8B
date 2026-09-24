@@ -835,6 +835,7 @@ def create_app(catalog_path: Optional[str] = None) -> FastAPI:
         from backend.service.harbor_job_service import (
             _read_task_metadata_type,
             resolve_agent_name,
+            resolve_cli_subscription_env,
             resolve_trial_profile,
         )
 
@@ -857,6 +858,15 @@ def create_app(catalog_path: Optional[str] = None) -> FastAPI:
             resolved_plane = normalize_execution_plane(
                 body.plane or default_execution_plane()
             )
+            extra_launch_env = (
+                resolve_cli_subscription_env(agent_name) if body.cliSubscription else None
+            )
+            if body.reasoningEffort and agent_name != "persona-codex":
+                raise ValueError(
+                    "reasoningEffort is only supported for persona-codex, not {}".format(
+                        agent_name
+                    )
+                )
             job_name = services.harbor_jobs.launch(
                 task_path=body.taskPath,
                 sample_size=body.sampleSize,
@@ -880,6 +890,8 @@ def create_app(catalog_path: Optional[str] = None) -> FastAPI:
                 persona_filters=body.personaFilters,
                 cohort_id=body.cohortId,
                 use_entire_pool=body.useEntirePool,
+                extra_launch_env=extra_launch_env,
+                reasoning_effort=body.reasoningEffort,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
