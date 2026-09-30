@@ -20,6 +20,7 @@ def test_resolve_openai_and_dashscope(monkeypatch) -> None:
 
 def test_resolve_gemini(monkeypatch) -> None:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     cred = resolve_provider_credential("gemini/gemini-2.5-pro")
     assert cred.provider == "Gemini"
     assert cred.env_var == "GEMINI_API_KEY"
@@ -60,6 +61,43 @@ def test_resolve_anthropic_default_and_bare_model() -> None:
         "ANTHROPIC_API_KEY"
     )
     assert resolve_provider_credential("claude-sonnet-4-6").provider == "Anthropic"
+
+
+def test_gemini_accepts_google_api_key_fallback(monkeypatch) -> None:
+    # playground.model_client reads GEMINI_API_KEY or GOOGLE_API_KEY.
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "sk-google-secret")
+    cred = resolve_provider_credential("gemini/gemini-2.5-pro")
+    assert cred.env_var == "GEMINI_API_KEY"
+    assert cred.present is True
+    assert cred.resolved_env_var == "GOOGLE_API_KEY"
+    joined = "\n".join(format_credential_preflight("gemini/gemini-2.5-pro"))
+    assert "GOOGLE_API_KEY present (used in place of GEMINI_API_KEY)" in joined
+    assert "missing" not in joined
+    assert "sk-google-secret" not in joined
+
+
+def test_anthropic_accepts_claude_api_key_fallback(monkeypatch) -> None:
+    # AnthropicJSONClient reads ANTHROPIC_API_KEY or CLAUDE_API_KEY.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("CLAUDE_API_KEY", "sk-claude-secret")
+    for model in ("anthropic/claude-sonnet-4-6", "claude-sonnet-4-6"):
+        cred = resolve_provider_credential(model)
+        assert cred.present is True
+        assert cred.resolved_env_var == "CLAUDE_API_KEY"
+    joined = "\n".join(format_credential_preflight("anthropic/claude-sonnet-4-6"))
+    assert "CLAUDE_API_KEY present (used in place of ANTHROPIC_API_KEY)" in joined
+    assert "sk-claude-secret" not in joined
+
+
+def test_preflight_missing_mentions_accepted_alternates(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    lines = format_credential_preflight("google/gemini-2.5-flash")
+    assert "Credential: GEMINI_API_KEY missing (GOOGLE_API_KEY also accepted)" in lines
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    lines = format_credential_preflight("openai/gpt-4o-mini")
+    assert "Credential: OPENAI_API_KEY missing" in lines
 
 
 def test_format_preflight_never_prints_secret(monkeypatch) -> None:
