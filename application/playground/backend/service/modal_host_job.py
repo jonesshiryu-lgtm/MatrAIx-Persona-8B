@@ -94,6 +94,7 @@ class ModalHostJobResult:
     artifact_tar: bytes | None = None
     error: str | None = None
     volume_path: str | None = None
+    jobs_dir: str = "jobs"
 
 
 class ModalHostJobRunner(Protocol):
@@ -180,6 +181,7 @@ def merge_job_artifacts(
     jobs_dir: Path,
     job_name: str,
     remote_repo: str = MODAL_REMOTE_REPO,
+    remote_jobs_dir: str = "jobs",
 ) -> Path:
     """Merge a packed Modal job tree into ``jobs/<job_name>/`` without clobbering meta."""
     jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -206,6 +208,7 @@ def merge_job_artifacts(
         remote_repo=remote_repo,
         local_job_dir=dest,
         job_name=job_name,
+        remote_jobs_dir=remote_jobs_dir,
     )
     return dest
 
@@ -288,14 +291,16 @@ def rewrite_job_artifact_paths(
     remote_repo: str,
     local_job_dir: Path,
     job_name: str,
+    remote_jobs_dir: str = "jobs",
 ) -> None:
     """Rewrite Modal absolute paths so Playground can read the local tree."""
     local = str(local_job_dir.resolve())
-    remote_job = "{}/jobs/{}".format(remote_repo.rstrip("/"), job_name)
+    remote_jobs = "{}/{}".format(remote_repo.rstrip("/"), remote_jobs_dir.strip("/"))
+    remote_job = "{}/{}".format(remote_jobs, job_name)
     replacements = (
         (remote_job, local),
         ("file://{}".format(remote_job), "file://{}".format(local)),
-        ("{}/jobs".format(remote_repo.rstrip("/")), str(local_job_dir.parent.resolve())),
+        (remote_jobs, str(local_job_dir.parent.resolve())),
     )
     for path in job_dir.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in _TEXT_REWRITE_SUFFIXES:
@@ -365,7 +370,9 @@ def execute_host_harbor_job(
 ) -> ModalHostJobResult:
     """Run Harbor and return a tarball of ``jobs/<job>``."""
     root = Path(work_root or request.repo_root)
-    config_yaml = prepare_modal_job_config(request.config_yaml, job_name=request.job_name)
+    config_yaml = prepare_modal_job_config(
+        request.config_yaml, job_name=request.job_name, jobs_dir=request.jobs_dir
+    )
     from backend.service.modal_docker_prebuild import (
         DockerPrebuildError,
         prepare_docker_environment_for_job,
@@ -386,7 +393,7 @@ def execute_host_harbor_job(
     env.update(request.secret_env)
     env["PYTHONPATH"] = modal_pythonpath(root)
     env["MATRIX_REPO_ROOT"] = str(root)
-    job_dir = root / "jobs" / request.job_name
+    job_dir = root / request.jobs_dir / request.job_name
     stop = threading.Event()
     interval = _live_interval_sec("MATRIX_MODAL_LIVE_PUSH_SEC")
 
@@ -424,6 +431,7 @@ def execute_host_harbor_job(
         artifact_tar=artifact,
         error=error,
         volume_path=request.job_name if job_dir.is_dir() else None,
+        jobs_dir=request.jobs_dir,
     )
 
 
@@ -658,6 +666,7 @@ def download_volume_job(
     job_name: str,
     dest: Path,
     incremental: bool = False,
+    remote_jobs_dir: str = "jobs",
 ) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     try:
@@ -671,7 +680,9 @@ def download_volume_job(
     local_job_name = job_name.split("/", 1)[0]
     try:
         if incremental:
-            _download_live_trial_deltas(volume, job_name, dest, staging)
+            _download_live_trial_deltas(
+                volume, job_name, dest, staging, remote_jobs_dir=remote_jobs_dir
+            )
         else:
             _download_volume_prefix(volume, job_name, staging)
             if any(staging.iterdir()):
@@ -681,6 +692,7 @@ def download_volume_job(
                 remote_repo=MODAL_REMOTE_REPO,
                 local_job_dir=dest,
                 job_name=local_job_name,
+                remote_jobs_dir=remote_jobs_dir,
             )
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -692,6 +704,8 @@ def _download_live_trial_deltas(
     job_name: str,
     dest: Path,
     staging: Path,
+    *,
+    remote_jobs_dir: str = "jobs",
 ) -> None:
     status = _read_volume_live_status(volume, job_name)
     if status is not None:
@@ -728,6 +742,7 @@ def _download_live_trial_deltas(
             remote_repo=MODAL_REMOTE_REPO,
             local_job_dir=dest,
             job_name=parent_job,
+            remote_jobs_dir=remote_jobs_dir,
         )
 
 
@@ -817,6 +832,7 @@ def pull_live_progress(
     volume: Any | None,
     volume_job_name: str,
     dest: Path,
+    remote_jobs_dir: str = "jobs",
 ) -> None:
     """Apply shard status overlay, then pull any flushed trial trees."""
     dest.mkdir(parents=True, exist_ok=True)
@@ -836,6 +852,7 @@ def pull_live_progress(
                 job_name=volume_job_name,
                 dest=dest,
                 incremental=True,
+                remote_jobs_dir=remote_jobs_dir,
             )
         except Exception:
             pass
@@ -848,6 +865,7 @@ def wait_modal_call_with_live_pull(
     volume_job_name: str,
     dest: Path | None,
     poll_sec: float = 5.0,
+    remote_jobs_dir: str = "jobs",
 ) -> Any:
     """Block on the Function while applying live status and flushed artifacts."""
     while True:
@@ -862,6 +880,7 @@ def wait_modal_call_with_live_pull(
                         volume=volume,
                         volume_job_name=volume_job_name,
                         dest=dest,
+                        remote_jobs_dir=remote_jobs_dir,
                     )
                 except Exception:
                     pass
@@ -889,6 +908,7 @@ def invoke_modal_host_function(
             volume_job_name=modal_volume_job_name(request.job_name, request.shard_key),
             dest=dest,
             poll_sec=_live_interval_sec("MATRIX_MODAL_LIVE_PULL_SEC"),
+            remote_jobs_dir=request.jobs_dir,
         )
     return fn.remote(payload)
 
@@ -961,6 +981,7 @@ class SdkModalHostJobRunner:
                 volume_job_name=modal_volume_job_name(request.job_name, request.shard_key),
                 dest=dest,
                 poll_sec=_live_interval_sec("MATRIX_MODAL_LIVE_PULL_SEC"),
+                remote_jobs_dir=request.jobs_dir,
             )
         except Exception as exc:  # noqa: BLE001
             raise ModalHostJobError(
@@ -993,7 +1014,7 @@ class SdkModalHostJobRunner:
         payload = {
             "jobName": request.job_name,
             "configYaml": request.config_yaml,
-            "jobsDir": "jobs",
+            "jobsDir": request.jobs_dir,
             "env": request.env,
             "secretEnv": request.secret_env or collect_orchestrator_secret_env(),
             "shardKey": request.shard_key,
@@ -1031,6 +1052,7 @@ class SdkModalHostJobRunner:
             artifact_tar=_decode_artifact(raw),
             error=str(raw["error"]) if raw.get("error") else None,
             volume_path=str(raw["volumePath"]) if raw.get("volumePath") else None,
+            jobs_dir=str(raw.get("jobsDir") or "jobs"),
         )
 
 
@@ -1055,7 +1077,12 @@ def materialize_modal_artifacts(
     dest = jobs_dir / job_name
     dest.mkdir(parents=True, exist_ok=True)
     if result.artifact_tar:
-        merge_job_artifacts(result.artifact_tar, jobs_dir=jobs_dir, job_name=job_name)
+        merge_job_artifacts(
+            result.artifact_tar,
+            jobs_dir=jobs_dir,
+            job_name=job_name,
+            remote_jobs_dir=result.jobs_dir,
+        )
     elif result.volume_path:
         try:
             import modal
@@ -1066,7 +1093,12 @@ def materialize_modal_artifacts(
         volume = modal.Volume.from_name(
             os.environ.get("MATRIX_MODAL_JOBS_VOLUME") or MODAL_JOBS_VOLUME_NAME
         )
-        download_volume_job(volume, job_name=result.volume_path, dest=dest)
+        download_volume_job(
+            volume,
+            job_name=result.volume_path,
+            dest=dest,
+            remote_jobs_dir=result.jobs_dir,
+        )
     else:
         raise ModalHostJobError(
             "Modal finished without returning jobs/{}/ artifacts".format(job_name)

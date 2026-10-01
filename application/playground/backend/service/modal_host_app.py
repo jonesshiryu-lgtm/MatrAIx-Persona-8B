@@ -154,7 +154,7 @@ def _complete_harbor_job(payload: dict) -> dict:
         job_name=str(payload["jobName"]),
         config_yaml=str(payload["configYaml"]),
         repo_root=MODAL_REMOTE_REPO,
-        jobs_dir="jobs",
+        jobs_dir=str(payload.get("jobsDir") or "jobs"),
         env=dict(payload.get("env") or {}),
         harbor_command=HARBOR_MODULE_COMMAND,
         secret_env=dict(payload.get("secretEnv") or {}),
@@ -179,7 +179,7 @@ def _complete_harbor_job(payload: dict) -> dict:
         work_root=Path(MODAL_REMOTE_REPO),
         progress=_live_publish,
     )
-    job_dir = Path(MODAL_REMOTE_REPO) / "jobs" / request.job_name
+    job_dir = Path(MODAL_REMOTE_REPO) / request.jobs_dir / request.job_name
     volume_path = None
     if job_dir.is_dir():
         publish_job_to_volume(job_dir, volume_root=volume_root, job_name=volume_name)
@@ -193,6 +193,7 @@ def _complete_harbor_job(payload: dict) -> dict:
         "error": result.error,
         "artifactTarB64": artifact_b64,
         "volumePath": volume_path,
+        "jobsDir": request.jobs_dir,
     }
 
 

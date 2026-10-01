@@ -87,6 +87,27 @@ def test_merge_skips_shard_job_result_json(tmp_path: Path) -> None:
     assert '"family": "modal"' in (merged / "compute.json").read_text(encoding="utf-8")
 
 
+def test_retry_artifacts_rewrite_isolated_modal_job_path(tmp_path: Path) -> None:
+    src = tmp_path / "remote" / "demo"
+    trial = src / "survey__retry"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        '{"trial_uri": "file:///matraix/jobs/retry-123/demo/survey__retry"}',
+        encoding="utf-8",
+    )
+
+    merged = merge_job_artifacts(
+        pack_job_dir(src),
+        jobs_dir=tmp_path / "jobs",
+        job_name="demo",
+        remote_jobs_dir="jobs/retry-123",
+    )
+
+    result = (merged / "survey__retry" / "result.json").read_text()
+    assert str((merged / "survey__retry").resolve()) in result
+    assert "/matraix/jobs/retry-123" not in result
+
+
 def test_rewrite_job_artifact_paths(tmp_path: Path) -> None:
     job_dir = tmp_path / "jobs" / "j1"
     job_dir.mkdir(parents=True)
@@ -136,6 +157,37 @@ def test_execute_host_harbor_job_uses_module_command(tmp_path: Path) -> None:
     assert "/Users/me/.venv/bin/harbor" not in command
     env = seen["env"]
     assert str(tmp_path / "packages" / "playground" / "src") in str(env["PYTHONPATH"])
+
+
+def test_planned_retry_uses_isolated_modal_worker_job_directory(tmp_path: Path) -> None:
+    old_job_dir = tmp_path / "jobs" / "j1"
+    old_job_dir.mkdir(parents=True)
+    (old_job_dir / "config.json").write_text('{"previous": true}', encoding="utf-8")
+    retry_job_dir = tmp_path / "jobs" / "retry-123456" / "j1"
+    request = ModalHostJobRequest(
+        job_name="j1",
+        config_yaml="job_name: j1\n",
+        repo_root=str(tmp_path),
+        jobs_dir="jobs/retry-123456",
+        env={},
+        shard_key="retry-123456",
+    )
+
+    def _runner(command, *, cwd, env):
+        del command, cwd, env
+        assert old_job_dir.is_dir()
+        assert not retry_job_dir.exists()
+        retry_job_dir.mkdir(parents=True)
+        (retry_job_dir / "result.json").write_text("{}", encoding="utf-8")
+        return 0
+
+    result = execute_host_harbor_job(request, command_runner=_runner, work_root=tmp_path)
+    assert result.exit_code == 0
+    assert result.jobs_dir == "jobs/retry-123456"
+    assert (old_job_dir / "config.json").is_file()
+    assert "jobs_dir: jobs/retry-123456" in (
+        tmp_path / "configs" / "jobs" / "modal-host-incoming" / "j1.yaml"
+    ).read_text()
 
 
 def test_execute_host_harbor_job_calls_progress(tmp_path: Path) -> None:

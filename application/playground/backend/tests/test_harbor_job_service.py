@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
+from pathlib import Path
+
+import pytest
+import yaml
 
 from backend.service.harbor_job_service import (
     EXTERNAL_RUN_STALE_AFTER_SEC,
@@ -58,6 +64,11 @@ def test_launch_writes_job_config(tmp_path, monkeypatch):
     assert config_path.is_file()
     text = config_path.read_text(encoding="utf-8")
     assert "persona_0001.yaml" in text or "persona_0002.yaml" in text
+    legacy_config = yaml.safe_load(text)
+    assert legacy_config["tasks"] == [
+        {"path": "application/tasks/example-survey_product-feedback"}
+    ]
+    assert "trial_plan" not in legacy_config
     assert service._executor.calls
     fn, args, kwargs = service._executor.calls[0]
     assert fn.__name__ == "_run_local_distributed"
@@ -73,6 +84,226 @@ def test_launch_writes_job_config(tmp_path, monkeypatch):
     assert detail["launch"]["status"] == "completed"
     assert len(detail["trials"]) == 2
 
+    service.shutdown()
+
+
+def test_launch_preserves_compiled_trial_plan(tmp_path, monkeypatch):
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+        command_runner=lambda *args, **kwargs: 0,
+        harbor_command=("echo", "harbor"),
+    )
+    service._executor = _FakeExecutor()
+    compiled = {
+        "job_name": "compiled-job",
+        "jobs_dir": "jobs",
+        "n_attempts": 2,
+        "n_concurrent_trials": 3,
+        "tasks": [
+            {"path": "application/tasks/survey_a"},
+            {"path": "application/tasks/survey_b"},
+        ],
+        "agents": [
+            {
+                "name": "persona-json-survey",
+                "kwargs": {
+                    "persona_path": "persona_0001.yaml",
+                    "survey_task_path": "application/tasks/survey_a",
+                },
+            },
+            {
+                "name": "persona-json-survey",
+                "kwargs": {
+                    "persona_path": "persona_0002.yaml",
+                    "survey_task_path": "application/tasks/survey_b",
+                },
+            },
+        ],
+        "trial_plan": [
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 1, "agent_index": 1},
+        ],
+        "_job_meta": {"condition_assignment": {"seed": 7}},
+    }
+
+    def _unexpected_build(*args, **kwargs):
+        raise AssertionError("compiled config must not be rebuilt")
+
+    monkeypatch.setattr(
+        "backend.service.harbor_job_service.build_application_job_config",
+        _unexpected_build,
+    )
+    job_name = service.launch(
+        task_path="application/tasks/survey_a",
+        compiled_job_config=compiled,
+        cohort_id="not-a-local-cohort",
+        sample_size=0,
+        execution_plane="harbor",
+    )
+
+    assert job_name == "compiled-job"
+    config = yaml.safe_load((tmp_path / "configs" / "compiled-job.yaml").read_text())
+    for key in ("tasks", "agents", "trial_plan", "n_attempts", "n_concurrent_trials"):
+        assert config[key] == compiled[key]
+    assert compiled["_job_meta"] == {"condition_assignment": {"seed": 7}}
+    assert "_job_meta" not in config
+    launch_meta = service._read_json(service._launch_meta_path(job_name))
+    assert launch_meta["jobMeta"] == compiled["_job_meta"]
+    assert service._executor.calls[0][0].__name__ == "_run_local_distributed"
+    service.shutdown()
+
+
+def test_launch_normalizes_compiled_trial_plan_indices_without_mutating_input(tmp_path):
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=tmp_path / "configs",
+    )
+    service._executor = _FakeExecutor()
+    compiled = {
+        "job_name": "normalized-plan",
+        "tasks": [{"path": "application/tasks/survey_a"}],
+        "agents": [{"name": "persona-json-survey"}],
+        "trial_plan": [{"task_index": "0", "agent_index": "0"}],
+    }
+
+    service.launch(
+        task_path="application/tasks/survey_a",
+        compiled_job_config=compiled,
+        execution_plane="harbor",
+    )
+
+    emitted = yaml.safe_load((tmp_path / "configs" / "normalized-plan.yaml").read_text())
+    assert emitted["trial_plan"] == [{"task_index": 0, "agent_index": 0}]
+    assert compiled["trial_plan"] == [{"task_index": "0", "agent_index": "0"}]
+    service.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("trial_plan", "message"),
+    [
+        ([{"task_index": 1, "agent_index": 0}], "task_index"),
+        ([{"task_index": 0, "agent_index": 1}], "agent_index"),
+    ],
+)
+def test_launch_rejects_invalid_compiled_trial_plan(
+    tmp_path, trial_plan, message
+):
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=tmp_path / "configs",
+    )
+    with pytest.raises(ValueError, match=message):
+        service.launch(
+            task_path="application/tasks/survey_a",
+            compiled_job_config={
+                "tasks": [{"path": "application/tasks/survey_a"}],
+                "agents": [{"name": "persona-json-survey"}],
+                "trial_plan": trial_plan,
+            },
+        )
+    service.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("family", "dispatch_name"),
+    [("modal", "_dispatch_modal_host"), ("gcp", "_dispatch_gke_host")],
+)
+def test_launch_cloud_shards_preserve_compiled_pairings(
+    tmp_path, monkeypatch, family, dispatch_name
+):
+    monkeypatch.setenv("MATRIX_HOST_PACK_CONCURRENCY", "1")
+    monkeypatch.setenv("MATRIX_SHARD_CONCURRENCY", "2")
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+        modal_host_job_runner=object(),
+        gke_host_job_runner=object(),
+    )
+    service._executor = _FakeExecutor()
+    compiled = {
+        "job_name": "compiled-cloud",
+        "jobs_dir": "jobs",
+        "n_concurrent_trials": 2,
+        "environment": {"type": "host", "env": {"KEEP_ME": "yes"}},
+        "tasks": [
+            {"path": "application/tasks/survey_a"},
+            {"path": "application/tasks/survey_b"},
+        ],
+        "agents": [
+            {"name": "persona-json-survey", "kwargs": {"persona_path": "persona_0001.yaml"}},
+            {"name": "persona-json-survey", "kwargs": {"persona_path": "persona_0002.yaml"}},
+        ],
+        "trial_plan": [
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 1, "agent_index": 1},
+        ],
+    }
+    service.launch(
+        task_path="application/tasks/survey_a",
+        compiled_job_config=compiled,
+        compute_family=family,
+        execution_plane="harbor",
+    )
+
+    parent = yaml.safe_load((tmp_path / "configs" / "compiled-cloud.yaml").read_text())
+    assert parent["tasks"] == compiled["tasks"]
+    assert parent["agents"] == compiled["agents"]
+    assert parent["trial_plan"] == compiled["trial_plan"]
+    assert parent["environment"] == compiled["environment"]
+    shard_paths = sorted((tmp_path / "configs").glob("compiled-cloud.shard-*.yaml"))
+    assert len(shard_paths) == 2
+    pairings = set()
+    for path in shard_paths:
+        shard = yaml.safe_load(path.read_text())
+        assert shard["tasks"] == compiled["tasks"]
+        assert len(shard["agents"]) == len(shard["trial_plan"]) == 1
+        entry = shard["trial_plan"][0]
+        pairings.add(
+            (
+                shard["tasks"][entry["task_index"]]["path"],
+                shard["agents"][entry["agent_index"]]["kwargs"]["persona_path"],
+            )
+        )
+    assert pairings == {
+        ("application/tasks/survey_a", "persona_0001.yaml"),
+        ("application/tasks/survey_b", "persona_0002.yaml"),
+    }
+    parent_path = tmp_path / "configs" / "compiled-cloud.yaml"
+    assert len(service._cloud_shard_work_items("compiled-cloud", parent_path)) == 2
+    shard_paths[0].unlink()
+    with pytest.raises(ValueError, match="planned shards"):
+        service._cloud_shard_work_items("compiled-cloud", parent_path)
+    shard_paths[1].unlink()
+    with pytest.raises(ValueError, match="planned shards"):
+        service._cloud_shard_work_items("compiled-cloud", parent_path)
+    assert service._executor.calls[0][0].__name__ == dispatch_name
+    service.shutdown()
+
+
+def test_launch_rejects_compiled_jobs_dir_mismatch(tmp_path):
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=tmp_path / "configs",
+    )
+    with pytest.raises(ValueError, match="jobs_dir"):
+        service.launch(
+            task_path="application/tasks/survey_a",
+            compiled_job_config={
+                "jobs_dir": "somewhere-else",
+                "tasks": [{"path": "application/tasks/survey_a"}],
+                "agents": [{"name": "persona-json-survey"}],
+            },
+        )
     service.shutdown()
 
 
@@ -247,6 +478,717 @@ def test_retry_failed_reruns_only_failed_trials(tmp_path, monkeypatch):
     service.shutdown()
 
 
+def test_planned_cloud_retry_uses_only_failed_pairs_and_attempts(tmp_path, monkeypatch):
+    from backend.service.modal_host_job import ModalHostJobResult, save_cloud_run
+    from harbor.models.trial.config import AgentConfig, TaskConfig
+
+    job_name = "planned-cloud-retry"
+    job_dir = tmp_path / "jobs" / job_name
+    job_dir.mkdir(parents=True)
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=tmp_path / "configs",
+        modal_host_job_runner=object(),
+    )
+    service._executor = _FakeExecutor()
+    config = {
+        "job_name": job_name,
+        "jobs_dir": "jobs",
+        "n_attempts": 2,
+        "n_concurrent_trials": 4,
+        "tasks": [{"path": "task-a"}, {"path": "task-b"}],
+        "agents": [
+            {"name": "persona-json-survey", "kwargs": {"persona_path": "persona_0001.yaml"}},
+            {"name": "persona-json-survey", "kwargs": {"persona_path": "persona_0002.yaml"}},
+        ],
+        "trial_plan": [
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 1, "agent_index": 1},
+            {"task_index": 0, "agent_index": 0},
+        ],
+    }
+    config_path = tmp_path / "configs" / f"{job_name}.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    service._persist_launch_meta(
+        job_name,
+        {
+            "configPath": str(config_path.relative_to(tmp_path)),
+            "jobConfig": config,
+            "computeDispatch": "modal_jobs",
+            "computeFamily": "modal",
+            "executionPlane": "harbor",
+            "shards": [
+                {"key": "s0", "index": 0, "kind": "cloud", "personaIds": ["0001", "0002"]}
+            ],
+        },
+    )
+    save_cloud_run(
+        job_dir,
+        {
+            "jobName": job_name,
+            "dispatch": "modal_jobs",
+            "status": "completed",
+            "shards": [{"key": "s0", "callId": "old-call", "state": "completed"}],
+        },
+    )
+    for trial_name, task_index, agent_index, failed in [
+        ("success-a-1", 0, 0, False),
+        ("success-a-2", 0, 0, False),
+        ("success-a-3", 0, 0, False),
+        ("failed-a", 0, 0, True),
+        ("success-b", 1, 1, False),
+        ("failed-b", 1, 1, True),
+    ]:
+        trial_dir = job_dir / trial_name
+        trial_dir.mkdir()
+        (trial_dir / "config.json").write_text(
+            json.dumps({"task": config["tasks"][task_index], "agent": config["agents"][agent_index]}),
+            encoding="utf-8",
+        )
+        (trial_dir / "result.json").write_text(
+            json.dumps({"exception_info": {"exception_type": "TimeoutError"}} if failed else {}),
+            encoding="utf-8",
+        )
+
+    assert service.retry_failed(job_name) == {"jobName": job_name, "retried": 2}
+    assert (job_dir / "success-a-1" / "result.json").is_file()
+    assert (job_dir / "success-a-2" / "result.json").is_file()
+    assert (job_dir / "success-a-3" / "result.json").is_file()
+    assert (job_dir / "success-b" / "result.json").is_file()
+    assert not (job_dir / "failed-a").exists()
+    assert not (job_dir / "failed-b").exists()
+    meta = service._read_json(service._launch_meta_path(job_name))
+    assert meta is not None
+    retry_row = meta["retryShards"][0]
+    assert retry_row["key"].startswith("retry-")
+    assert retry_row["key"] != "s0"
+    retry_cfg = yaml.safe_load((tmp_path / retry_row["configPath"]).read_text())
+    assert retry_cfg["n_attempts"] == 1
+    assert retry_cfg["tasks"] == [
+        TaskConfig.model_validate(task).model_dump(mode="json")
+        for task in config["tasks"]
+    ]
+    assert retry_cfg["agents"] == [
+        AgentConfig.model_validate(agent).model_dump(mode="json")
+        for agent in config["agents"]
+    ]
+    assert retry_cfg["trial_plan"] == [
+        {"task_index": 0, "agent_index": 0},
+        {"task_index": 1, "agent_index": 1},
+    ]
+    assert service._executor.calls[0][0].__name__ == "_dispatch_modal_host"
+
+    service._launches[job_name].status = "failed"
+    service._maybe_rollup_job_result(job_name)
+    assert service._read_json(service._launch_meta_path(job_name))["retryShards"][0] == retry_row
+    for result in [{}, {"exception_info": {"exception_type": "TimeoutError"}}]:
+        partial = job_dir / "partial-output"
+        partial.mkdir()
+        (partial / "config.json").write_text(
+            json.dumps({"task": config["tasks"][0], "agent": config["agents"][0]}),
+            encoding="utf-8",
+        )
+        (partial / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        with pytest.raises(ValueError, match="partial retry output"):
+            service.retry_failed(job_name)
+        assert (partial / "result.json").is_file()
+        shutil.rmtree(partial)
+
+    assert service.retry_failed(job_name) == {"jobName": job_name, "retried": 2}
+    assert all((job_dir / name / "result.json").is_file() for name in [
+        "success-a-1", "success-a-2", "success-a-3", "success-b"
+    ])
+    resumed_meta = service._read_json(service._launch_meta_path(job_name))
+    resumed_row = resumed_meta["retryShards"][0]
+    assert resumed_row["key"].startswith("retry-")
+    assert resumed_row["key"] != retry_row["key"]
+    resumed_cfg = yaml.safe_load((tmp_path / resumed_row["configPath"]).read_text())
+    for key in ("tasks", "agents", "trial_plan", "n_attempts"):
+        assert resumed_cfg[key] == retry_cfg[key]
+    retry_row = resumed_row
+
+    class _SpawnRunner:
+        def __init__(self):
+            self.spawned = []
+            self.waited = []
+
+        def spawn(self, request):
+            self.spawned.append(request.shard_key)
+            assert request.jobs_dir == f"jobs/{request.shard_key}"
+            return "new-call", object()
+
+        def wait(self, request, *, call, call_id):
+            self.waited.append(call_id)
+            return ModalHostJobResult(exit_code=0)
+
+    runner = _SpawnRunner()
+    monkeypatch.setattr(
+        "backend.service.modal_host_job.materialize_modal_artifacts",
+        lambda *args, **kwargs: None,
+    )
+    work = service._cloud_shard_work_items(job_name, config_path)
+    codes, errors = service._spawn_and_wait_cloud_shards(
+        "modal_jobs", job_name, work, {}, runner
+    )
+    assert (codes, errors) == ([0], [])
+    assert runner.spawned == [retry_row["key"]]
+    assert runner.waited == ["new-call"]
+    service.shutdown()
+
+
+def test_planned_cloud_retry_rejects_unplanned_failed_pair(tmp_path):
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=tmp_path / "configs",
+    )
+    failed = tmp_path / "jobs" / "job" / "failed"
+    failed.mkdir(parents=True)
+    (failed / "config.json").write_text(
+        json.dumps({"task": {"path": "other-task"}, "agent": {"name": "oracle"}}),
+        encoding="utf-8",
+    )
+    meta = {
+        "jobConfig": {
+            "tasks": [{"path": "task-a"}],
+            "agents": [{"name": "oracle"}],
+            "trial_plan": [{"task_index": 0, "agent_index": 0}],
+        }
+    }
+
+    with pytest.raises(ValueError, match="pairing is absent"):
+        service._planned_retry_shard(meta, [failed], job_name="job", kind="cloud")
+    service.shutdown()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["empty", "non-list", "invalid-row", "missing-file", "partial", "tampered", "erased-plan"],
+)
+def test_planned_cloud_resume_rejects_invalid_retry_shards(tmp_path, case):
+    job_name = "planned-cloud-resume"
+    config_path = tmp_path / "configs" / f"{job_name}.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "job_name": job_name,
+                "trial_plan": [{"task_index": 0, "agent_index": 0}],
+            }
+            if case == "erased-plan"
+            else {"job_name": job_name}
+        ),
+        encoding="utf-8",
+    )
+    retry_yaml = "job_name: planned-cloud-resume\n"
+    (config_path.parent / "existing.yaml").write_text(retry_yaml, encoding="utf-8")
+    valid_row = {
+        "key": "retry-one",
+        "configPath": "configs/existing.yaml",
+        "configSha256": hashlib.sha256(retry_yaml.encode("utf-8")).hexdigest(),
+    }
+    missing_row = {
+        "key": "retry-two",
+        "configPath": "configs/missing.yaml",
+        "configSha256": "0" * 64,
+    }
+    retry_shards = {
+        "empty": [],
+        "non-list": "invalid",
+        "invalid-row": [{}],
+        "missing-file": [missing_row],
+        "partial": [valid_row, missing_row],
+        "tampered": [valid_row],
+        "erased-plan": [],
+    }[case]
+    if case == "tampered":
+        (config_path.parent / "existing.yaml").write_text(
+            "job_name: altered\n", encoding="utf-8"
+        )
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=config_path.parent,
+    )
+    service._persist_launch_meta(
+        job_name,
+        {
+            "jobConfig": {
+                "trial_plan": [] if case == "erased-plan" else [{"task_index": 0, "agent_index": 0}]
+            },
+            "retryShards": retry_shards,
+        },
+    )
+
+    with pytest.raises(ValueError, match="planned retry"):
+        service._cloud_shard_work_items(job_name, config_path)
+    service.shutdown()
+
+
+def test_planned_cloud_retry_rejects_negative_saved_index_before_cleanup(tmp_path):
+    job_name = "negative-plan-index"
+    job_dir = tmp_path / "jobs" / job_name
+    failed = job_dir / "failed-trial"
+    failed.mkdir(parents=True)
+    (failed / "result.json").write_text(
+        json.dumps({"exception_info": {"exception_type": "TimeoutError"}}),
+        encoding="utf-8",
+    )
+    (failed / "config.json").write_text(
+        json.dumps({"task": {"path": "task-a"}, "agent": {"name": "oracle"}}),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "configs" / f"{job_name}.yaml"
+    config_path.parent.mkdir()
+    job_config = {
+        "tasks": [{"path": "task-a"}],
+        "agents": [{"name": "oracle"}],
+        "trial_plan": [{"task_index": -1, "agent_index": 0}],
+    }
+    config_path.write_text(yaml.safe_dump(job_config), encoding="utf-8")
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=config_path.parent,
+    )
+    service._persist_launch_meta(
+        job_name,
+        {
+            "configPath": str(config_path.relative_to(tmp_path)),
+            "computeDispatch": "modal_jobs",
+            "jobConfig": job_config,
+        },
+    )
+
+    with pytest.raises(ValueError, match="task_index"):
+        service.retry_failed(job_name)
+    assert (failed / "result.json").is_file()
+    service.shutdown()
+
+
+def test_planned_retry_keeps_failure_when_work_items_cannot_be_persisted(
+    tmp_path, monkeypatch
+):
+    job_name = "retry-metadata-write"
+    failed = tmp_path / "jobs" / job_name / "failed-trial"
+    failed.mkdir(parents=True)
+    (failed / "result.json").write_text(
+        json.dumps({"exception_info": {"exception_type": "TimeoutError"}}),
+        encoding="utf-8",
+    )
+    config = {
+        "tasks": [{"path": "task-a"}],
+        "agents": [{"name": "oracle"}],
+        "trial_plan": [{"task_index": 0, "agent_index": 0}],
+    }
+    (failed / "config.json").write_text(
+        json.dumps({"task": config["tasks"][0], "agent": config["agents"][0]}),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "configs" / f"{job_name}.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=config_path.parent,
+    )
+    service._persist_launch_meta(
+        job_name,
+        {
+            "configPath": str(config_path.relative_to(tmp_path)),
+            "computeDispatch": "modal_jobs",
+            "jobConfig": config,
+        },
+    )
+    monkeypatch.setattr(service, "_persist_launch_meta", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="retryShards could not be persisted"):
+        service.retry_failed(job_name)
+    assert (failed / "result.json").is_file()
+    service.shutdown()
+
+
+@pytest.mark.parametrize("stale", [None, "generated", "metadata", "condition-marker"])
+def test_unsharded_planned_retry_checks_generated_config_before_cleanup(tmp_path, stale):
+    job_name = "local-plan-retry"
+    job_dir = tmp_path / "jobs" / job_name
+    failed = job_dir / "failed-trial"
+    failed.mkdir(parents=True)
+    (failed / "result.json").write_text(
+        json.dumps({"exception_info": {"exception_type": "TimeoutError"}}),
+        encoding="utf-8",
+    )
+    config = {
+        "job_name": job_name,
+        "tasks": [{"path": "task-a"}, {"path": "task-b"}],
+        "agents": [{"name": "oracle"}],
+        "trial_plan": [{"task_index": 0, "agent_index": 0}],
+    }
+    config_path = tmp_path / "configs" / f"{job_name}.yaml"
+    config_path.parent.mkdir()
+    generated = (
+        {**config, "trial_plan": [{"task_index": 1, "agent_index": 0}]}
+        if stale == "generated"
+        else {**config, "trial_plan": []}
+        if stale == "condition-marker"
+        else config
+    )
+    config_path.write_text(yaml.safe_dump(generated), encoding="utf-8")
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=config_path.parent,
+    )
+    service._executor = _FakeExecutor()
+    service._persist_launch_meta(
+        job_name,
+        {
+            "configPath": str(config_path.relative_to(tmp_path)),
+            "jobConfig": (
+                {**config, "trial_plan": []}
+                if stale in {"metadata", "condition-marker"}
+                else config
+            ),
+            **(
+                {"jobMeta": {"condition_assignment": {"seed": 7}}}
+                if stale == "condition-marker"
+                else {}
+            ),
+        },
+    )
+
+    if stale:
+        with pytest.raises(ValueError, match="generated config changed since launch"):
+            service.retry_failed(job_name)
+        assert (failed / "result.json").is_file()
+        assert not service._executor.calls
+    else:
+        assert service.retry_failed(job_name) == {"jobName": job_name, "retried": 1}
+        assert not failed.exists()
+        assert service._executor.calls
+    service.shutdown()
+
+
+@pytest.mark.parametrize("compute_dispatch", [None, "modal_jobs"])
+def test_dataset_backed_planned_retry_is_unsupported_without_removing_failure(
+    tmp_path, compute_dispatch
+):
+    job_name = "dataset-plan"
+    job_dir = tmp_path / "jobs" / job_name
+    failed = job_dir / "failed-trial"
+    failed.mkdir(parents=True)
+    (failed / "result.json").write_text(
+        json.dumps({"exception_info": {"exception_type": "TimeoutError"}}),
+        encoding="utf-8",
+    )
+    (failed / "config.json").write_text(
+        json.dumps({"task": {"path": "resolved-task"}, "agent": {"name": "oracle"}}),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "configs" / f"{job_name}.yaml"
+    config_path.parent.mkdir()
+    job_config = {
+        "tasks": [],
+        "datasets": [{"path": "dataset"}],
+        "agents": [{"name": "oracle"}],
+        "trial_plan": [{"task_index": 0, "agent_index": 0}],
+    }
+    config_path.write_text(yaml.safe_dump(job_config), encoding="utf-8")
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=tmp_path / "configs",
+    )
+    service._persist_launch_meta(
+        job_name,
+        {
+            "configPath": str(config_path.relative_to(tmp_path)),
+            "computeDispatch": compute_dispatch,
+            "jobConfig": job_config,
+        },
+    )
+
+    with pytest.raises(ValueError, match="Dataset-backed trial_plan retry is unsupported"):
+        service.retry_failed(job_name)
+
+    assert failed.is_dir()
+    assert (failed / "result.json").is_file()
+    service.shutdown()
+
+
+@pytest.mark.parametrize("planned", [False, True])
+def test_cloud_dispatch_normalizes_only_planned_trial_config_for_resume(
+    tmp_path, monkeypatch, planned
+):
+    from backend.service.modal_host_job import ModalHostJobResult
+    from harbor.models.trial.config import TrialConfig
+
+    job_name = "cloud-resume"
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / job_name
+    job_dir.mkdir(parents=True)
+    task = {"path": "task-a"}
+    agent = {
+        "name": "persona-json-survey",
+        "kwargs": {"persona_path": "persona_0001.yaml"},
+    }
+    config = {
+        "job_name": job_name,
+        "jobs_dir": "jobs",
+        "tasks": [task],
+        "agents": [agent],
+    }
+    if planned:
+        config["trial_plan"] = [{"task_index": 0, "agent_index": 0}]
+    config_path = tmp_path / "configs" / f"{job_name}.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    class _Runner:
+        calls = 0
+
+        def run(self, request):
+            self.calls += 1
+            assert request.job_name == job_name
+            return ModalHostJobResult(exit_code=0)
+
+    runner = _Runner()
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=config_path.parent,
+        modal_host_job_runner=runner,
+    )
+    service._persist_launch_meta(
+        job_name,
+        {
+            "jobConfig": config,
+            "configPath": str(config_path.relative_to(tmp_path)),
+            "computeDispatch": "modal_jobs",
+        },
+    )
+    service._launches[job_name] = HarborLaunchRecord(job_name=job_name)
+
+    remote_trials_dir = f"/workspace/jobs/s0/{job_name}"
+
+    def _materialize(_result, *, jobs_dir, job_name):
+        trial_dir = jobs_dir / job_name / "trial-a"
+        trial_dir.mkdir(parents=True)
+        (trial_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "task": task,
+                    "agent": agent,
+                    "trials_dir": remote_trials_dir,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (trial_dir / "result.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "backend.service.modal_host_job.materialize_modal_artifacts", _materialize
+    )
+    monkeypatch.setattr(service, "_maybe_rollup_job_result", lambda _job_name: None)
+    monkeypatch.setattr(service, "_maybe_run_host_verifier", lambda _job_name: None)
+    monkeypatch.setattr(service, "_maybe_generate_post_run_feedback", lambda _job_name: None)
+    monkeypatch.setattr(service, "_maybe_schedule_reporting", lambda *_args: None)
+
+    service._dispatch_modal_host(job_name, config_path)
+
+    assert runner.calls == 1
+    assert service._launches[job_name].status == "completed"
+    merged = TrialConfig.model_validate_json(
+        (job_dir / "trial-a" / "config.json").read_text()
+    )
+    parent = TrialConfig.model_validate(
+        {"task": task, "agent": agent, "trials_dir": str(Path("jobs") / job_name)}
+    )
+    if planned:
+        assert merged == parent
+    else:
+        assert merged.trials_dir == Path(remote_trials_dir)
+    service.shutdown()
+
+
+def test_planned_harbor_fanout_retry_runs_only_failed_attempt_and_merges(
+    tmp_path, monkeypatch
+):
+    job_name = "planned-harbor-retry"
+    jobs_dir = tmp_path / "jobs"
+    job_dir = jobs_dir / job_name
+    job_dir.mkdir(parents=True)
+    commands = []
+
+    def _run_retry(command, *, cwd, env):
+        commands.append(list(command))
+        retry_cfg = yaml.safe_load((cwd / command[command.index("-c") + 1]).read_text())
+        worker_dir = cwd / retry_cfg["jobs_dir"] / job_name
+        retried = worker_dir / "retried-a"
+        retried.mkdir(parents=True)
+        (retried / "config.json").write_text(
+            json.dumps(
+                {
+                    "task": retry_cfg["tasks"][0],
+                    "agent": retry_cfg["agents"][0],
+                    "trials_dir": str(worker_dir),
+                }
+            ),
+            encoding="utf-8",
+        )
+        (retried / "result.json").write_text("{}", encoding="utf-8")
+        return 0
+
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+        command_runner=_run_retry,
+        harbor_command=("echo", "harbor"),
+    )
+    service._executor = _FakeExecutor()
+    config = {
+        "job_name": job_name,
+        "jobs_dir": "jobs",
+        "n_attempts": 2,
+        "n_concurrent_trials": 4,
+        "tasks": [{"path": "task-a"}, {"path": "task-b"}],
+        "agents": [
+            {"name": "persona-json-survey", "kwargs": {"persona_path": "persona_0001.yaml"}},
+            {"name": "persona-json-survey", "kwargs": {"persona_path": "persona_0002.yaml"}},
+        ],
+        "trial_plan": [
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 1, "agent_index": 1},
+        ],
+    }
+    config_path = tmp_path / "configs" / f"{job_name}.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    service._persist_launch_meta(
+        job_name,
+        {
+            "configPath": str(config_path.relative_to(tmp_path)),
+            "jobConfig": config,
+            "computeFamily": "modal",
+            "executionPlane": "harbor",
+            "shards": [
+                {"key": "s0", "index": 0, "kind": "harbor", "personaIds": ["0001", "0002"]}
+            ],
+        },
+    )
+    service._launches[job_name] = HarborLaunchRecord(
+        job_name=job_name,
+        status="completed",
+        config_path=str(config_path.relative_to(tmp_path)),
+        started_at="2026-07-01T12:00:00Z",
+    )
+    for trial_name, task_index, agent_index, failed in [
+        ("success-a", 0, 0, False),
+        ("failed-a", 0, 0, True),
+        ("success-b-1", 1, 1, False),
+        ("success-b-2", 1, 1, False),
+    ]:
+        trial_dir = job_dir / trial_name
+        trial_dir.mkdir()
+        (trial_dir / "config.json").write_text(
+            json.dumps({"task": config["tasks"][task_index], "agent": config["agents"][agent_index]}),
+            encoding="utf-8",
+        )
+        (trial_dir / "result.json").write_text(
+            json.dumps({"exception_info": {"exception_type": "TimeoutError"}} if failed else {}),
+            encoding="utf-8",
+        )
+
+    assert service.retry_failed(job_name) == {"jobName": job_name, "retried": 1}
+    meta = service._read_json(service._launch_meta_path(job_name))
+    assert meta is not None
+    retry_row = meta["retryShards"][0]
+    assert retry_row["kind"] == "harbor"
+    assert retry_row["key"].startswith("retry-")
+    assert retry_row["key"] != "s0"
+    retry_cfg = yaml.safe_load((tmp_path / retry_row["configPath"]).read_text())
+    assert retry_cfg["n_attempts"] == 1
+    assert retry_cfg["trial_plan"] == [{"task_index": 0, "agent_index": 0}]
+    assert retry_cfg["tasks"][0]["path"] == "task-a"
+    assert retry_cfg["agents"][0]["kwargs"]["persona_path"] == "persona_0001.yaml"
+    assert retry_cfg["jobs_dir"] == (
+        f"jobs/{job_name}/_generated/work/{retry_row['key']}"
+    )
+    assert (job_dir / "success-a" / "result.json").is_file()
+    assert not (job_dir / "failed-a").exists()
+
+    monkeypatch.setattr(
+        service, "_run_with_trial_host_scoring", lambda _job_name, operation: operation()
+    )
+    monkeypatch.setattr(service, "_maybe_rollup_job_result", lambda _job_name: None)
+    monkeypatch.setattr(service, "_maybe_run_host_verifier", lambda _job_name: None)
+    monkeypatch.setattr(service, "_maybe_generate_post_run_feedback", lambda _job_name: None)
+    monkeypatch.setattr(service, "_maybe_schedule_reporting", lambda *_args: None)
+    fn, args, kwargs = service._executor.calls[0]
+    assert fn.__name__ == "_run_harbor"
+    fn(*args, **kwargs)
+
+    assert len(commands) == 1
+    assert (job_dir / "retried-a" / "result.json").is_file()
+    saved_config = json.loads((job_dir / "retried-a" / "config.json").read_text())
+    assert saved_config["trials_dir"] == str(Path("jobs") / job_name)
+    assert (job_dir / "success-a" / "result.json").is_file()
+    assert (job_dir / "success-b-1" / "result.json").is_file()
+    assert (job_dir / "success-b-2" / "result.json").is_file()
+    assert not (job_dir / "_generated" / "work" / retry_row["key"]).exists()
+    service.shutdown()
+
+
+def test_planned_harbor_fanout_merge_rewrites_trial_directory_for_resume(tmp_path):
+    from harbor.models.trial.config import TrialConfig
+
+    job_name = "planned-harbor-merge"
+    jobs_dir = tmp_path / "jobs"
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=jobs_dir,
+        generated_configs_dir=tmp_path / "configs",
+    )
+    service._persist_launch_meta(
+        job_name,
+        {
+            "jobConfig": {
+                "jobs_dir": "jobs",
+                "trial_plan": [{"task_index": 0, "agent_index": 0}],
+            }
+        },
+    )
+    staged = jobs_dir / job_name / "_generated" / "work" / "s0" / job_name
+    trial_dir = staged / "trial-a"
+    trial_dir.mkdir(parents=True)
+    trial_config = {
+        "task": {"path": "task-a"},
+        "agent": {
+            "name": "persona-json-survey",
+            "kwargs": {"persona_path": "persona_0001.yaml"},
+        },
+        "trials_dir": str(staged.relative_to(tmp_path)),
+    }
+    (trial_dir / "config.json").write_text(json.dumps(trial_config), encoding="utf-8")
+    (trial_dir / "result.json").write_text("{}", encoding="utf-8")
+
+    service._merge_harbor_shard_tree(job_name, "s0")
+
+    merged = TrialConfig.model_validate_json(
+        (jobs_dir / job_name / "trial-a" / "config.json").read_text()
+    )
+    expected = TrialConfig.model_validate(
+        {**trial_config, "trials_dir": str(Path("jobs") / job_name)}
+    )
+    assert merged == expected
+    assert not staged.parent.exists()
+    service.shutdown()
+
+
 def test_retry_failed_no_failures_is_noop(tmp_path, monkeypatch):
     repo = tmp_path
     jobs_dir = repo / "jobs"
@@ -261,6 +1203,10 @@ def test_retry_failed_no_failures_is_noop(tmp_path, monkeypatch):
         generated_configs_dir=repo / "configs" / "jobs",
     )
     service._executor = _FakeExecutor()
+    service._persist_launch_meta(
+        "clean-job",
+        {"jobConfig": {"tasks": [{"path": "task-a"}]}, "retryShards": [{"key": "s0"}]},
+    )
 
     assert service.retry_failed("clean-job") == {"jobName": "clean-job", "retried": 0}
     assert service._executor.calls == []
@@ -1305,6 +2251,37 @@ def test_list_jobs_counts_overlay_and_expected_agents(tmp_path):
     assert rows["pg-live"]["trialCount"] == 4
     assert rows["pg-live"]["completedTrials"] == 1
     assert rows["pg-live"]["status"] == "running"
+    service.shutdown()
+
+
+def test_expected_trial_count_uses_plan_and_attempts_without_changing_legacy(tmp_path):
+    job_dir = tmp_path / "jobs" / "planned"
+    job_dir.mkdir(parents=True)
+    config = {
+        "agents": [{}, {}, {}],
+        "tasks": [{}, {}],
+        "n_attempts": 2,
+        "trial_plan": [
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 1, "agent_index": 2},
+        ],
+    }
+    config_path = job_dir / "config.json"
+    service = HarborJobService(
+        repo_root=tmp_path,
+        jobs_dir=tmp_path / "jobs",
+        generated_configs_dir=tmp_path / "configs",
+    )
+
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    assert service._expected_trial_count("planned", job_dir) == 4
+    config_path.write_text(json.dumps({**config, "trial_plan": []}), encoding="utf-8")
+    assert service._expected_trial_count("planned", job_dir) == 3
+    config_path.write_text(
+        json.dumps({key: value for key, value in config.items() if key != "trial_plan"}),
+        encoding="utf-8",
+    )
+    assert service._expected_trial_count("planned", job_dir) == 3
     service.shutdown()
 
 

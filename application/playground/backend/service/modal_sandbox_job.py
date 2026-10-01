@@ -90,7 +90,7 @@ def run_sandbox_worker(payload: dict[str, Any] | None = None) -> int:
         job_name=str(loaded.get("jobName") or ""),
         config_yaml=str(loaded.get("configYaml") or ""),
         repo_root=MODAL_REMOTE_REPO,
-        jobs_dir="jobs",
+        jobs_dir=str(loaded.get("jobsDir") or "jobs"),
         env=dict(loaded.get("env") or {}),
         secret_env={},
         shard_key=str(loaded.get("shardKey") or "").strip(),
@@ -124,7 +124,7 @@ def run_sandbox_worker(payload: dict[str, Any] | None = None) -> int:
         work_root=Path(MODAL_REMOTE_REPO),
         progress=_live_publish,
     )
-    job_dir = Path(MODAL_REMOTE_REPO) / "jobs" / request.job_name
+    job_dir = Path(MODAL_REMOTE_REPO) / request.jobs_dir / request.job_name
     write_sandbox_live_status(job_dir)
     volume_path = None
     if job_dir.is_dir():
@@ -162,6 +162,7 @@ def wait_sandbox_with_live_pull(
                 dest=dest,
                 volume=volume,
                 volume_job_name=volume_job_name,
+                remote_jobs_dir=request.jobs_dir,
             )
         if code is not None:
             return int(code)
@@ -174,11 +175,17 @@ def pull_sandbox_live(
     dest: Path,
     volume: Any | None,
     volume_job_name: str,
+    remote_jobs_dir: str = "jobs",
 ) -> None:
     raw = sandbox_exec_bytes(sandbox, "cat", SANDBOX_LIVE_PATH)
     if raw:
         apply_worker_live_status(dest, raw)
-    pull_live_progress(volume=volume, volume_job_name=volume_job_name, dest=dest)
+    pull_live_progress(
+        volume=volume,
+        volume_job_name=volume_job_name,
+        dest=dest,
+        remote_jobs_dir=remote_jobs_dir,
+    )
 
 
 def sandbox_returncode(sandbox: Any) -> int | None:
@@ -332,6 +339,7 @@ class SdkModalSandboxJobRunner:
                 volume=volume,
                 volume_job_name=volume_job_name,
                 dest=dest,
+                remote_jobs_dir=request.jobs_dir,
             )
         stored = read_sandbox_result(volume, volume_job_name) if volume is not None else None
         if exit_code is None and stored and stored.get("exitCode") is not None:
@@ -352,6 +360,7 @@ class SdkModalSandboxJobRunner:
             exit_code=exit_code,
             error=error,
             volume_path=volume_path,
+            jobs_dir=request.jobs_dir,
         )
 
     def run(self, request: ModalHostJobRequest) -> ModalHostJobResult:
@@ -401,6 +410,7 @@ class SdkModalSandboxJobRunner:
             "configYaml": request.config_yaml,
             "env": request.env,
             "shardKey": request.shard_key,
+            "jobsDir": request.jobs_dir,
         }
         encoded = json.dumps(payload).encode("utf-8")
         handle = tempfile.NamedTemporaryFile(delete=False, suffix=".json")

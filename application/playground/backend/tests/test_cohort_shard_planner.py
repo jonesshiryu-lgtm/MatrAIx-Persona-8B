@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from copy import deepcopy
+
+import pytest
+
 from backend.service.cohort_shard_planner import (
     plan_cohort_shards,
     plan_job_config_shards,
@@ -70,6 +75,133 @@ def test_plan_job_config_shards_keeps_job_name():
     assert not should_fanout_harbor_shards(
         family="local", environment="docker", dispatch=None, shard_count=20
     )
+
+
+def test_empty_trial_plan_keeps_unplanned_shard_configs() -> None:
+    config = {
+        "tasks": [{"path": "task-a"}, {"path": "task-b"}],
+        "agents": [{"name": "agent-0"}, {"name": "agent-1"}, {"name": "agent-2"}],
+        "trial_plan": [],
+    }
+
+    shards = plan_job_config_shards(config, shard_size=2)
+
+    assert [shard_config["trial_plan"] for _, shard_config in shards] == [[], []]
+    assert [shard_config["tasks"] for _, shard_config in shards] == [
+        config["tasks"],
+        config["tasks"],
+    ]
+    assert [len(shard_config["agents"]) for _, shard_config in shards] == [2, 1]
+
+
+def test_planned_job_rejects_out_of_range_agent_index() -> None:
+    config = {
+        "agents": [{"name": "agent-0"}],
+        "trial_plan": [{"task_index": 0, "agent_index": 1}],
+    }
+
+    with pytest.raises(ValueError, match="agent_index"):
+        plan_job_config_shards(config, shard_size=1)
+
+
+def test_planned_job_shards_keep_exact_task_persona_pairs() -> None:
+    config = {
+        "job_name": "condition-run",
+        "n_attempts": 2,
+        "tasks": [{"path": "task-a"}, {"path": "task-b"}],
+        "agents": [
+            {"name": "persona-json-survey", "kwargs": {"persona_path": f"persona_{i}.yaml"}}
+            for i in range(4)
+        ],
+        "trial_plan": [
+            {"task_index": 1, "agent_index": 2},
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 0, "agent_index": 3},
+            {"task_index": 1, "agent_index": 1},
+        ],
+    }
+    original = deepcopy(config)
+
+    shards = plan_job_config_shards(config, shard_size=2)
+
+    assert len(shards) == 2
+    assert [row[1]["trial_plan"] for row in shards] == [
+        [{"task_index": 0, "agent_index": 0}, {"task_index": 1, "agent_index": 1}],
+        [{"task_index": 1, "agent_index": 0}, {"task_index": 0, "agent_index": 1}],
+    ]
+    assert all(shard_config["tasks"] == config["tasks"] for _, shard_config in shards)
+    assert all(shard_config["n_attempts"] == 2 for _, shard_config in shards)
+
+    def resolved_pairs(job: dict) -> Counter[tuple[str, str]]:
+        return Counter(
+            (
+                job["tasks"][entry["task_index"]]["path"],
+                job["agents"][entry["agent_index"]]["kwargs"]["persona_path"],
+            )
+            for entry in job["trial_plan"]
+        )
+
+    assert sum((resolved_pairs(shard_config) for _, shard_config in shards), Counter()) == (
+        resolved_pairs(config)
+    )
+    assert {
+        agent["kwargs"]["persona_path"]
+        for _, shard_config in shards
+        for agent in shard_config["agents"]
+    } == {agent["kwargs"]["persona_path"] for agent in config["agents"]}
+    assert config == original
+
+
+def test_planned_job_omits_empty_shards_without_cartesian_fallback() -> None:
+    config = {
+        "tasks": [{"path": "task-a"}, {"path": "task-b"}],
+        "agents": [
+            {"name": "persona-json-survey", "kwargs": {"persona_path": f"persona_{i}.yaml"}}
+            for i in range(8)
+        ],
+        "trial_plan": [
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 1, "agent_index": 7},
+        ],
+        "n_concurrent_trials": 4,
+    }
+
+    planned = plan_job_shards(config, trial_profile="json_survey", pack=1, max_workers=4)
+
+    assert [shard.offset for shard, _ in planned.shards] == [0, 6]
+    assert [shard.shard_index for shard, _ in planned.shards] == [0, 1]
+    assert [shard.shard_count for shard, _ in planned.shards] == [2, 2]
+    assert [shard_config["trial_plan"] for _, shard_config in planned.shards] == [
+        [{"task_index": 0, "agent_index": 0}],
+        [{"task_index": 1, "agent_index": 1}],
+    ]
+    assert planned.layout.worker_count == 2
+    assert planned.layout.per_shard_concurrent == (1, 1)
+    assert planned.layout.effective_parallel == 2
+    assert all(shard_config["trial_plan"] for _, shard_config in planned.shards)
+
+
+def test_planned_job_parallel_counts_only_paired_agents() -> None:
+    config = {
+        "agents": [{"name": f"agent-{i}"} for i in range(8)],
+        "trial_plan": [
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 1, "agent_index": 1},
+            {"task_index": 0, "agent_index": 1},
+            {"task_index": 1, "agent_index": 6},
+        ],
+        "n_concurrent_trials": 4,
+    }
+
+    planned = plan_job_shards(config, trial_profile="json_survey", pack=2, max_workers=4)
+
+    assert planned.layout.worker_count == 2
+    assert planned.layout.per_shard_concurrent == (2, 1)
+    assert planned.layout.effective_parallel == 3
+    assert [shard_config["n_concurrent_trials"] for _, shard_config in planned.shards] == [
+        2,
+        1,
+    ]
 
 
 def test_shard_size_default_is_100(monkeypatch) -> None:

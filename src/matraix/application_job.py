@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,7 @@ import yaml
 from matraix.compute_family import resolve_compute_plan
 from matraix.persona_agent_context import apply_persona_context_to_agent_spec
 from matraix.persona_job import (
+    get_persona_field_value,
     load_manifest,
     sample_personas,
     sample_personas_stratified,
@@ -62,6 +65,138 @@ def resolve_job_environment(
         cua_backend=cua_backend,
         compute_family=compute_family,
     ).harbor_environment()
+
+
+def build_condition_assignment_manifest(
+    personas: list[dict[str, Any]],
+    *,
+    conditions: list[dict[str, Any]],
+    block_by: list[str],
+    seed: int,
+    repo_root: Path,
+) -> dict[str, Any]:
+    """Deterministically assign each persona to exactly one condition.
+
+    Assignment is balanced independently within each block. Inputs are
+    canonicalized so persona/condition list ordering does not affect the
+    resulting manifest.
+    """
+    if not personas:
+        raise ValueError("condition assignment requires at least one persona")
+    if not conditions:
+        raise ValueError("condition assignment requires at least one condition")
+
+    normalized_conditions: list[dict[str, str]] = []
+    seen_condition_ids: set[str] = set()
+    for raw in conditions:
+        condition_id = str(raw.get("id") or "").strip()
+        task = str(raw.get("task") or "").strip()
+        if not condition_id:
+            raise ValueError("condition id is required")
+        if condition_id in seen_condition_ids:
+            raise ValueError(f"duplicate condition id: {condition_id}")
+        if not task:
+            raise ValueError(f"condition {condition_id!r} requires task")
+        seen_condition_ids.add(condition_id)
+        normalized_conditions.append(
+            {
+                "id": condition_id,
+                "task": task,
+            }
+        )
+
+    # Condition input ordering must not influence assignment.
+    normalized_conditions.sort(key=lambda item: item["id"])
+
+    normalized_block_by: list[str] = []
+    seen_block_fields: set[str] = set()
+    for raw_field in block_by:
+        field = str(raw_field).strip()
+        if not field or field in seen_block_fields:
+            continue
+        seen_block_fields.add(field)
+        normalized_block_by.append(field)
+
+    buckets: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    seen_persona_ids: set[str] = set()
+
+    for persona in personas:
+        persona_id = str(persona.get("persona_id") or "").strip()
+        if not persona_id:
+            raise ValueError("condition assignment persona_id is required")
+        if persona_id in seen_persona_ids:
+            raise ValueError(f"duplicate persona_id in condition assignment: {persona_id}")
+        seen_persona_ids.add(persona_id)
+
+        block_values: list[str] = []
+        for field in normalized_block_by:
+            try:
+                value = get_persona_field_value(
+                    persona,
+                    field,
+                    repo_root=repo_root,
+                )
+            except (FileNotFoundError, OSError):
+                value = None
+
+            if value is None or not str(value).strip():
+                raise ValueError(
+                    f"persona {persona_id!r} is missing block field {field!r}"
+                )
+            block_values.append(str(value))
+
+        buckets.setdefault(tuple(block_values), []).append(persona)
+
+    assignments: list[dict[str, Any]] = []
+
+    for block_key in sorted(buckets):
+        block_personas = sorted(
+            buckets[block_key],
+            key=lambda item: (
+                str(item.get("persona_id") or ""),
+                str(item.get("path") or ""),
+            ),
+        )
+
+        # Derive an isolated RNG seed for each block so assignments do not depend
+        # on input ordering or on the size/order of other blocks.
+        seed_material = "{}\x1e{}".format(
+            int(seed),
+            "\x1f".join(block_key),
+        ).encode("utf-8")
+        block_seed = int.from_bytes(
+            hashlib.sha256(seed_material).digest()[:8],
+            "big",
+        )
+        rng = random.Random(block_seed)
+
+        rng.shuffle(block_personas)
+        condition_order = list(normalized_conditions)
+        rng.shuffle(condition_order)
+
+        block = dict(zip(normalized_block_by, block_key))
+        for index, persona in enumerate(block_personas):
+            condition = condition_order[index % len(condition_order)]
+            assignments.append(
+                {
+                    "persona_id": str(persona["persona_id"]),
+                    "persona_path": str(persona.get("path") or ""),
+                    "condition_id": condition["id"],
+                    "task": condition["task"],
+                    "block": block,
+                }
+            )
+
+    # Persist a canonical manifest independent of execution order.
+    assignments.sort(key=lambda item: item["persona_id"])
+
+    return {
+        "method": "blocked_randomization",
+        "seed": int(seed),
+        "block_by": normalized_block_by,
+        "conditions": normalized_conditions,
+        "assignments": assignments,
+    }
 
 
 def select_personas(
@@ -215,6 +350,30 @@ def build_application_job_config(
     job_spec = spec.get("job", {})
     job_slug = spec.get("name", "application-task-job")
 
+    condition_assignment: dict[str, Any] | None = None
+    if "conditions" in spec:
+        if trial_profile != "json_survey":
+            raise ValueError("conditions require trial_profile=json_survey")
+        conditions = spec["conditions"]
+        if not isinstance(conditions, list):
+            raise ValueError("conditions must be a list")
+        assignment = spec.get("assignment", {})
+        if not isinstance(assignment, dict):
+            raise ValueError("assignment must be a mapping")
+        method = str(assignment.get("method", "blocked_randomization")).strip()
+        if method != "blocked_randomization":
+            raise ValueError(f"unsupported assignment method: {method}")
+        block_by = assignment.get("block_by", [])
+        if not isinstance(block_by, list):
+            raise ValueError("assignment block_by must be a list")
+        condition_assignment = build_condition_assignment_manifest(
+            chosen,
+            conditions=conditions,
+            block_by=block_by,
+            seed=int(assignment.get("seed", seed)),
+            repo_root=repo_root,
+        )
+
     agents = [
         apply_persona_context_to_agent_spec(
             {
@@ -226,6 +385,27 @@ def build_application_job_config(
         )
         for entry in chosen
     ]
+
+    if condition_assignment is None:
+        tasks = [
+            {
+                "path": resolve_harbor_task_path(
+                    spec["task"], trial_profile=trial_profile
+                )
+            }
+        ]
+    else:
+        # Keep condition tasks explicit so saved trials can be mapped back to
+        # these indexes during retry; dataset-resolved indexes are not replayed
+        # by the Playground retry path.
+        tasks = [
+            {
+                "path": resolve_harbor_task_path(
+                    condition["task"], trial_profile=trial_profile
+                )
+            }
+            for condition in condition_assignment["conditions"]
+        ]
 
     job: dict[str, Any] = {
         "job_name": job_spec.get("job_name", job_slug),
@@ -248,10 +428,10 @@ def build_application_job_config(
             ),
         ),
         "agents": agents,
-        "tasks": [{"path": resolve_harbor_task_path(spec["task"], trial_profile=trial_profile)}],
+        "tasks": tasks,
         "_job_meta": {
             "job_slug": job_slug,
-            "task": spec["task"],
+            "task": spec["task"] if condition_assignment is None else spec.get("task"),
             "sample_size": len(chosen),
             "sample_size_per_value_group": per_value_group,
             "seed": seed,
@@ -267,4 +447,22 @@ def build_application_job_config(
     verifier = spec.get("verifier")
     if verifier:
         job["verifier"] = verifier
+    if condition_assignment is not None:
+        task_index_by_condition_id = {
+            condition["id"]: index
+            for index, condition in enumerate(condition_assignment["conditions"])
+        }
+        agent_index_by_persona_id = {
+            str(entry["persona_id"]): index for index, entry in enumerate(chosen)
+        }
+        trial_plan = []
+        for assignment in condition_assignment["assignments"]:
+            task_index = task_index_by_condition_id[assignment["condition_id"]]
+            agent_index = agent_index_by_persona_id[assignment["persona_id"]]
+            agents[agent_index]["kwargs"]["survey_task_path"] = tasks[task_index]["path"]
+            trial_plan.append(
+                {"task_index": task_index, "agent_index": agent_index}
+            )
+        job["trial_plan"] = trial_plan
+        job["_job_meta"]["condition_assignment"] = condition_assignment
     return job

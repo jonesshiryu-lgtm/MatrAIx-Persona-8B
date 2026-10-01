@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import time
 import tomllib
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -725,6 +727,10 @@ class HarborJobService:
         job_config = self._job_config_for_listing(job_name, job_dir)
         if not isinstance(job_config, dict):
             return 0
+        trial_plan = job_config.get("trial_plan")
+        if isinstance(trial_plan, list) and trial_plan:
+            attempts = max(1, int(job_config.get("n_attempts") or 1))
+            return len(trial_plan) * attempts
         agents = job_config.get("agents")
         if not isinstance(agents, list):
             return 0
@@ -1235,6 +1241,7 @@ class HarborJobService:
         execution_plane: str | None = None,
         compute_family: str | None = None,
         extra_launch_env: dict[str, str] | None = None,
+        compiled_job_config: dict[str, Any] | None = None,
     ) -> str:
         from backend.service.execution_plane import (
             ExecutionPlaneError,
@@ -1259,9 +1266,32 @@ class HarborJobService:
             )
         if os_app_backend is None and cua_backend is not None:
             os_app_backend = cua_backend
-        if persona_ids is not None and len(persona_ids) == 0:
+        if compiled_job_config is not None:
+            from harbor.models.job.config import JobConfig
+
+            if not isinstance(compiled_job_config, dict):
+                raise ValueError("compiled_job_config must be a mapping")
+            job_config = deepcopy(compiled_job_config)
+            # Validate a separate copy because legacy Pydantic migration validators
+            # may mutate their input. Keep the original recipe and _job_meta intact.
+            validated = JobConfig.model_validate(deepcopy(job_config))
+            if not validated.tasks and not validated.datasets:
+                raise ValueError("compiled_job_config requires tasks or datasets")
+            if not validated.agents:
+                raise ValueError("compiled_job_config requires agents")
+            for entry in validated.trial_plan:
+                if not validated.datasets and entry.task_index >= len(validated.tasks):
+                    raise ValueError(f"trial_plan task_index out of range: {entry.task_index}")
+                if entry.agent_index >= len(validated.agents):
+                    raise ValueError(f"trial_plan agent_index out of range: {entry.agent_index}")
+            if "trial_plan" in job_config:
+                # Run the same parsed plan Harbor validated, including normalized indexes.
+                job_config["trial_plan"] = [entry.model_dump() for entry in validated.trial_plan]
+            if "_job_meta" in job_config and not isinstance(job_config["_job_meta"], dict):
+                raise ValueError("compiled_job_config._job_meta must be a mapping")
+        if compiled_job_config is None and persona_ids is not None and len(persona_ids) == 0:
             raise ValueError("persona_ids must not be empty when provided")
-        if not persona_ids and not use_entire_pool and sample_size < 1:
+        if compiled_job_config is None and not persona_ids and not use_entire_pool and sample_size < 1:
             raise ValueError("sample_size must be >= 1")
 
         resolved_persona_ids = list(persona_ids or [])
@@ -1271,7 +1301,7 @@ class HarborJobService:
         resolved_filters = persona_filters
         resolved_use_entire_pool = bool(use_entire_pool)
 
-        if cohort_id:
+        if compiled_job_config is None and cohort_id:
             from backend.service.persona_pool_service import PersonaPoolService
 
             resolved = PersonaPoolService.from_repo(repo_root=self.repo_root).resolve_cohort_launch(
@@ -1286,7 +1316,8 @@ class HarborJobService:
                 resolved_persona_ids = list(resolved["personaIds"])
 
         if (
-            not resolved_persona_ids
+            compiled_job_config is None
+            and not resolved_persona_ids
             and not resolved_use_entire_pool
             and (resolved_sources or resolved_filters)
         ):
@@ -1306,23 +1337,26 @@ class HarborJobService:
 
         # Hand-picked ids from the 1M root are preview-only until materialized.
         # Mirror sample_production_1m: write a cohort, then launch against it.
-        from backend.service.persona_1m_pool import (
-            is_production_1m_root,
-            materialize_production_1m_persona_ids,
-        )
-
-        if is_production_1m_root(resolved_pool) and resolved_persona_ids:
-            materialized = materialize_production_1m_persona_ids(
-                repo_root=self.repo_root,
-                persona_ids=resolved_persona_ids,
-                seed=resolved_seed,
+        if compiled_job_config is None:
+            from backend.service.persona_1m_pool import (
+                is_production_1m_root,
+                materialize_production_1m_persona_ids,
             )
-            resolved_pool = str(materialized["pool"])
-            resolved_persona_ids = list(materialized["personaIds"])
+
+            if is_production_1m_root(resolved_pool) and resolved_persona_ids:
+                materialized = materialize_production_1m_persona_ids(
+                    repo_root=self.repo_root,
+                    persona_ids=resolved_persona_ids,
+                    seed=resolved_seed,
+                )
+                resolved_pool = str(materialized["pool"])
+                resolved_persona_ids = list(materialized["personaIds"])
 
         task_slug = _slug(Path(task_path).name)
-        resolved_job_name = job_name or "pg-{}-{}".format(task_slug, uuid.uuid4().hex[:8])
-        model = persona_model or default_persona_model()
+        compiled_name = str(job_config.get("job_name") or "").strip() if compiled_job_config is not None else ""
+        if job_name and compiled_name and job_name != compiled_name:
+            raise ValueError("job_name must match compiled_job_config.job_name")
+        resolved_job_name = job_name or compiled_name or "pg-{}-{}".format(task_slug, uuid.uuid4().hex[:8])
         trial_profile = resolve_trial_profile(
             task_path,
             mode=execution_mode,
@@ -1391,87 +1425,105 @@ class HarborJobService:
             resolved_survey_task_path = normalized_task_path
         elif trial_profile == "user_sim_chat":
             resolved_chat_task_path = task_path.strip().replace("\\", "/")
-        agent = resolve_agent_name(
-            task_path,
-            repo_root=self.repo_root,
-            explicit=agent_name,
-            mode=execution_mode,
-            trial_profile=trial_profile,
-        )
-        from matraix.web_task_environment import resolve_web_harbor_task_path
+        if compiled_job_config is None:
+            model = persona_model or default_persona_model()
+            agent = resolve_agent_name(
+                task_path,
+                repo_root=self.repo_root,
+                explicit=agent_name,
+                mode=execution_mode,
+                trial_profile=trial_profile,
+            )
+            from matraix.web_task_environment import resolve_web_harbor_task_path
 
-        harbor_task_path = resolve_web_harbor_task_path(
-            task_path,
-            agent_name=agent,
-            repo_root=self.repo_root,
-        )
+            harbor_task_path = resolve_web_harbor_task_path(
+                task_path,
+                agent_name=agent,
+                repo_root=self.repo_root,
+            )
 
-        spec = {
-            "name": resolved_job_name,
-            "task": harbor_task_path,
-            "persona_pool": resolved_pool,
-            "sample_size": len(resolved_persona_ids) if resolved_persona_ids else sample_size,
-            "seed": resolved_seed,
-            "persona_ids": resolved_persona_ids,
-            "use_entire_pool": resolved_use_entire_pool and not resolved_persona_ids,
-            "execution_mode": execution_mode,
-            "trial_profile": trial_profile,
-            "cua_backend": os_app_backend,
-            "compute_family": compute_plan.family,
-            "agent": {"name": agent, "model_name": model},
-            "job": {
-                "job_name": resolved_job_name,
-                "jobs_dir": _rel_path(self.jobs_dir, self.repo_root),
-                "n_concurrent_trials": n_concurrent_trials,
-            },
-        }
-        from matraix.application_job import resolve_harbor_task_path
+            spec = {
+                "name": resolved_job_name,
+                "task": harbor_task_path,
+                "persona_pool": resolved_pool,
+                "sample_size": len(resolved_persona_ids) if resolved_persona_ids else sample_size,
+                "seed": resolved_seed,
+                "persona_ids": resolved_persona_ids,
+                "use_entire_pool": resolved_use_entire_pool and not resolved_persona_ids,
+                "execution_mode": execution_mode,
+                "trial_profile": trial_profile,
+                "cua_backend": os_app_backend,
+                "compute_family": compute_plan.family,
+                "agent": {"name": agent, "model_name": model},
+                "job": {
+                    "job_name": resolved_job_name,
+                    "jobs_dir": _rel_path(self.jobs_dir, self.repo_root),
+                    "n_concurrent_trials": n_concurrent_trials,
+                },
+            }
+            from matraix.application_job import resolve_harbor_task_path
 
-        resolved_task_path = resolve_harbor_task_path(harbor_task_path, trial_profile=trial_profile)
-        job_config = build_application_job_config(spec, repo_root=self.repo_root)
-        from matraix.persona_agent_context import apply_persona_context_to_agent_spec
+            resolved_task_path = resolve_harbor_task_path(
+                harbor_task_path, trial_profile=trial_profile
+            )
+            job_config = build_application_job_config(spec, repo_root=self.repo_root)
+            from matraix.persona_agent_context import apply_persona_context_to_agent_spec
 
-        for agent_cfg in job_config.get("agents", []):
-            if isinstance(agent_cfg, dict):
-                apply_persona_context_to_agent_spec(
-                    agent_cfg,
-                    model_name=str(agent_cfg.get("model_name") or model),
-                )
-        # os_app_submission_profile / cua_submission_profile are no longer injected:
-        # agents mirror final_answer only; task verifiers recover named JSON.
-        job_config["environment"] = compute_plan.harbor_environment()
-        if os_app_backend:
-            env_type = ""
+            for agent_cfg in job_config.get("agents", []):
+                if isinstance(agent_cfg, dict):
+                    apply_persona_context_to_agent_spec(
+                        agent_cfg,
+                        model_name=str(agent_cfg.get("model_name") or model),
+                    )
+            # os_app_submission_profile / cua_submission_profile are no longer injected:
+            # agents mirror final_answer only; task verifiers recover named JSON.
+            job_config["environment"] = compute_plan.harbor_environment()
+            if os_app_backend:
+                env_type = ""
+                env_block = job_config.get("environment")
+                if isinstance(env_block, dict):
+                    env_type = str(env_block.get("type") or "")
+                for agent in job_config.get("agents", []):
+                    if isinstance(agent, dict):
+                        kwargs = agent.setdefault("kwargs", {})
+                        if isinstance(kwargs, dict):
+                            kwargs["cua_backend"] = os_app_backend
+                            # use.computer CUA agents take max_steps (default 50);
+                            # Docker Computer1 takes max_turns. Give both more
+                            # headroom for stocks/news-style browse+decide tasks.
+                            if env_type == "use-computer":
+                                kwargs.setdefault("max_steps", 100)
+                            else:
+                                kwargs.setdefault("max_turns", 100)
+            # use-computer OS-app tasks hand in JSON; sandbox path remap makes
+            # *remote* in-VM verify flaky. Disable Harbor's per-trial verifier and
+            # score on the Playground host as each trial finishes (watcher), with a
+            # job-end rescue sweep (see playground.host_verifier).
             env_block = job_config.get("environment")
-            if isinstance(env_block, dict):
-                env_type = str(env_block.get("type") or "")
-            for agent in job_config.get("agents", []):
-                if isinstance(agent, dict):
-                    kwargs = agent.setdefault("kwargs", {})
-                    if isinstance(kwargs, dict):
-                        kwargs["cua_backend"] = os_app_backend
-                        # use.computer CUA agents take max_steps (default 50);
-                        # Docker Computer1 takes max_turns. Give both more
-                        # headroom for stocks/news-style browse+decide tasks.
-                        if env_type == "use-computer":
+            if isinstance(env_block, dict) and env_block.get("type") == "use-computer":
+                existing_verifier = job_config.get("verifier")
+                verifier_cfg = dict(existing_verifier) if isinstance(existing_verifier, dict) else {}
+                verifier_cfg["disable"] = True
+                job_config["verifier"] = verifier_cfg
+                for agent in job_config.get("agents", []):
+                    if isinstance(agent, dict):
+                        kwargs = agent.setdefault("kwargs", {})
+                        if isinstance(kwargs, dict):
                             kwargs.setdefault("max_steps", 100)
-                        else:
-                            kwargs.setdefault("max_turns", 100)
-        # use-computer OS-app tasks hand in JSON; sandbox path remap makes
-        # *remote* in-VM verify flaky. Disable Harbor's per-trial verifier and
-        # score on the Playground host as each trial finishes (watcher), with a
-        # job-end rescue sweep (see playground.host_verifier).
-        env_block = job_config.get("environment")
-        if isinstance(env_block, dict) and env_block.get("type") == "use-computer":
-            existing_verifier = job_config.get("verifier")
-            verifier_cfg = dict(existing_verifier) if isinstance(existing_verifier, dict) else {}
-            verifier_cfg["disable"] = True
-            job_config["verifier"] = verifier_cfg
-            for agent in job_config.get("agents", []):
-                if isinstance(agent, dict):
-                    kwargs = agent.setdefault("kwargs", {})
-                    if isinstance(kwargs, dict):
-                        kwargs.setdefault("max_steps", 100)
+        else:
+            # The recipe already contains the resolved task/agent pairings.
+            # task_path is only the launch metadata and compute-profile hint.
+            resolved_task_path = task_path
+            job_config["job_name"] = resolved_job_name
+            job_config.setdefault("jobs_dir", _rel_path(self.jobs_dir, self.repo_root))
+            configured_jobs_dir = Path(job_config["jobs_dir"])
+            if not configured_jobs_dir.is_absolute():
+                configured_jobs_dir = self.repo_root / configured_jobs_dir
+            if configured_jobs_dir.resolve() != self.jobs_dir.resolve():
+                raise ValueError("compiled_job_config.jobs_dir must match service jobs_dir")
+            env_block = job_config.get("environment")
+            if not isinstance(env_block, dict) or env_block.get("type") != compute_plan.environment:
+                job_config["environment"] = compute_plan.harbor_environment()
         job_meta = job_config.pop("_job_meta", None)
 
         self.generated_configs_dir.mkdir(parents=True, exist_ok=True)
@@ -1554,21 +1606,24 @@ class HarborJobService:
                     shard_header + yaml.safe_dump(shard_cfg, sort_keys=False),
                     encoding="utf-8",
                 )
-                shard_records.append(
-                    {
-                        "index": shard.shard_index,
-                        "count": shard.shard_count,
-                        "offset": shard.offset,
-                        "limit": shard.limit,
-                        "key": shard.key,
-                        "kind": "harbor" if fanout_harbor else "cloud",
-                        "personaIds": list(shard.persona_ids),
-                        "nConcurrentTrials": int(
-                            shard_cfg.get("n_concurrent_trials") or 1
-                        ),
-                        "configPath": _rel_path(shard_path, self.repo_root),
-                    }
-                )
+                shard_record = {
+                    "index": shard.shard_index,
+                    "count": shard.shard_count,
+                    "offset": shard.offset,
+                    "limit": shard.limit,
+                    "key": shard.key,
+                    "kind": "harbor" if fanout_harbor else "cloud",
+                    "personaIds": list(shard.persona_ids),
+                    "nConcurrentTrials": int(
+                        shard_cfg.get("n_concurrent_trials") or 1
+                    ),
+                    "configPath": _rel_path(shard_path, self.repo_root),
+                }
+                if job_config.get("trial_plan"):
+                    shard_record["configSha256"] = hashlib.sha256(
+                        shard_path.read_bytes()
+                    ).hexdigest()
+                shard_records.append(shard_record)
             generated = self.jobs_dir / resolved_job_name / "_generated"
             generated.mkdir(parents=True, exist_ok=True)
             (generated / "shards.json").write_text(
@@ -1642,6 +1697,11 @@ class HarborJobService:
                 "chatMaxTurns": chat_max_turns,
                 "extraLaunchEnv": normalized_extra_env or None,
                 "jobConfig": job_config,
+                **(
+                    {"jobMeta": job_meta}
+                    if compiled_job_config is not None and job_meta is not None
+                    else {}
+                ),
                 "shards": shard_records,
             },
         )
@@ -1815,8 +1875,8 @@ class HarborJobService:
             chat_max_turns=chat_max_turns,
             job_name=job_name,
         )
-        work = self._cloud_shard_work_items(job_name, config_path)
         try:
+            work = self._cloud_shard_work_items(job_name, config_path)
             held: dict[str, Any] = {}
 
             def _invoke() -> None:
@@ -1872,7 +1932,40 @@ class HarborJobService:
         from backend.service.modal_host_job import merge_job_dir
 
         merge_job_dir(staged, self.jobs_dir / job_name)
+        self._normalize_planned_trial_dirs_for_resume(
+            job_name,
+            trial_names=[path.name for path in staged.iterdir() if path.is_dir()],
+        )
         shutil.rmtree(staged.parent, ignore_errors=True)
+
+    def _normalize_planned_trial_dirs_for_resume(
+        self, job_name: str, *, trial_names: list[str] | None = None
+    ) -> None:
+        meta = self._read_json(self._launch_meta_path(job_name)) or {}
+        job_config = meta.get("jobConfig")
+        if not isinstance(job_config, dict) or not job_config.get("trial_plan"):
+            return
+        # Workers can use a different jobs_dir. The merged config must match
+        # the parent TrialConfig that Harbor builds when resuming this job.
+        parent_trials_dir = str(Path(job_config.get("jobs_dir") or "jobs") / job_name)
+        job_dir = self.jobs_dir / job_name
+        names = (
+            trial_names
+            if trial_names is not None
+            else [path.name for path in job_dir.iterdir() if path.is_dir()]
+        )
+        for name in names:
+            if name.startswith("_") or Path(name).name != name:
+                continue
+            saved_path = job_dir / name / "config.json"
+            saved_config = self._read_json(saved_path)
+            if saved_config is None or saved_config.get("trials_dir") == parent_trials_dir:
+                continue
+            saved_config["trials_dir"] = parent_trials_dir
+            saved_path.write_text(
+                json.dumps(saved_config, indent=2, default=str) + "\n",
+                encoding="utf-8",
+            )
 
     def _dispatch_modal_host(
         self,
@@ -1934,6 +2027,58 @@ class HarborJobService:
         config_path: Path,
     ) -> list[tuple[str, Path]]:
         meta = self._read_json(self._launch_meta_path(job_name)) or {}
+        job_config = meta.get("jobConfig")
+        job_meta = meta.get("jobMeta")
+        planned = (
+            isinstance(job_config, dict) and bool(job_config.get("trial_plan"))
+        ) or (isinstance(job_meta, dict) and bool(job_meta.get("condition_assignment")))
+        if ("retryShards" in meta or meta.get("shards")) and not planned:
+            try:
+                generated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError):
+                generated = None
+            planned = isinstance(generated, dict) and bool(generated.get("trial_plan"))
+        strict_kind = (
+            "planned retry"
+            if planned and "retryShards" in meta
+            else "planned shards"
+            if planned and meta.get("shards")
+            else None
+        )
+        if strict_kind is not None:
+            shard_rows = meta["retryShards"] if strict_kind == "planned retry" else meta["shards"]
+            if not isinstance(shard_rows, list) or not shard_rows:
+                raise ValueError(f"Cannot resume {strict_kind}: shard entries are missing")
+            strict_items: list[tuple[str, Path]] = []
+            seen_keys: set[str] = set()
+            for row in shard_rows:
+                if not isinstance(row, dict):
+                    raise ValueError(f"Cannot resume {strict_kind}: invalid shard entry")
+                key = row.get("key")
+                rel = row.get("configPath")
+                expected_hash = row.get("configSha256")
+                if (
+                    not isinstance(key, str)
+                    or not key
+                    or key in seen_keys
+                    or not isinstance(rel, str)
+                    or not rel
+                    or not isinstance(expected_hash, str)
+                    or len(expected_hash) != 64
+                ):
+                    raise ValueError(f"Cannot resume {strict_kind}: invalid shard entry")
+                path = self.repo_root / rel
+                if not path.is_file():
+                    raise ValueError(
+                        f"Cannot resume {strict_kind}: configPath is unavailable for {key}"
+                    )
+                if hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+                    raise ValueError(
+                        f"Cannot resume {strict_kind}: configPath changed for {key}"
+                    )
+                seen_keys.add(key)
+                strict_items.append((key, path))
+            return strict_items
         shards = meta.get("retryShards") if isinstance(meta.get("retryShards"), list) else []
         if not shards:
             shards = meta.get("shards") if isinstance(meta.get("shards"), list) else []
@@ -1984,7 +2129,6 @@ class HarborJobService:
             for_remote=True,
             job_name=job_name,
         )
-        work = self._cloud_shard_work_items(job_name, config_path)
         errors: list[str] = []
         codes: list[int] = []
 
@@ -1997,6 +2141,7 @@ class HarborJobService:
             return self._invoke_modal_host(job_name, shard_path, shard_key, env)
 
         try:
+            work = self._cloud_shard_work_items(job_name, config_path)
             runner = self._cloud_host_runner(dispatch)
             if self._runner_supports_spawn(runner):
                 codes, errors = self._spawn_and_wait_cloud_shards(
@@ -2021,6 +2166,13 @@ class HarborJobService:
             if exit_code != 0 and not error:
                 error = "cloud host shards exited with codes {}".format(codes)
             status = "completed" if exit_code == 0 else "failed"
+        except Exception as exc:  # noqa: BLE001
+            status = "failed"
+            error = str(exc)
+            exit_code = 1
+
+        try:
+            self._normalize_planned_trial_dirs_for_resume(job_name)
         except Exception as exc:  # noqa: BLE001
             status = "failed"
             error = str(exc)
@@ -2153,7 +2305,7 @@ class HarborJobService:
             job_name=job_name,
             config_yaml=config_path.read_text(encoding="utf-8"),
             repo_root=str(self.repo_root.resolve()),
-            jobs_dir="jobs",
+            jobs_dir=f"jobs/{shard_key}" if shard_key.startswith("retry-") else "jobs",
             env=filter_remote_harbor_payload_env(env),
             harbor_command=HARBOR_MODULE_COMMAND,
             secret_env=collect_orchestrator_secret_env(),
@@ -2270,7 +2422,7 @@ class HarborJobService:
             job_name=job_name,
             config_yaml=config_path.read_text(encoding="utf-8"),
             repo_root=str(self.repo_root.resolve()),
-            jobs_dir="jobs",
+            jobs_dir=f"jobs/{shard_key}" if shard_key.startswith("retry-") else "jobs",
             env=filter_remote_harbor_payload_env(env),
             harbor_command=HARBOR_MODULE_COMMAND,
             secret_env=collect_orchestrator_secret_env(),
@@ -2363,8 +2515,8 @@ class HarborJobService:
             for_remote=True,
             job_name=job_name,
         )
-        work = self._cloud_shard_work_items(job_name, config_path)
         try:
+            work = self._cloud_shard_work_items(job_name, config_path)
             client = self._remote_client()
             last_error: str | None = None
             for index, (shard_key, shard_path) in enumerate(work):
@@ -2792,7 +2944,7 @@ class HarborJobService:
             record = self._launches.get(job_name)
         started = record.started_at if record is not None else None
         try:
-            synthesize_job_result(
+            result_path = synthesize_job_result(
                 self.jobs_dir / job_name,
                 job_config=meta.get("jobConfig") if isinstance(meta.get("jobConfig"), dict) else None,
                 started_at=started,
@@ -2801,6 +2953,26 @@ class HarborJobService:
         except Exception:  # noqa: BLE001
             return
         if meta.get("retryShards"):
+            job_config = meta.get("jobConfig")
+            job_meta = meta.get("jobMeta")
+            retry_rows = meta["retryShards"]
+            planned_retry = (
+                isinstance(job_config, dict) and bool(job_config.get("trial_plan"))
+            ) or (
+                isinstance(job_meta, dict) and bool(job_meta.get("condition_assignment"))
+            ) or any(
+                isinstance(row, dict) and row.get("baselineCompletedFingerprint")
+                for row in retry_rows
+            )
+            if planned_retry:
+                result = self._read_json(result_path) or {}
+                stats = result.get("stats") if isinstance(result.get("stats"), dict) else {}
+                if (
+                    record is None
+                    or record.status != "completed"
+                    or stats.get("n_completed_trials") != result.get("n_total_trials")
+                ):
+                    return
             meta.pop("retryShards", None)
             self._persist_launch_meta(job_name, meta)
 
@@ -2867,6 +3039,192 @@ class HarborJobService:
             )
         return retry_rows
 
+    def _planned_retry_shard(
+        self,
+        meta: dict[str, Any],
+        failed_dirs: list[Path],
+        *,
+        job_name: str,
+        kind: str,
+    ) -> list[dict[str, Any]]:
+        """Retry each failed planned trial once, using its saved task and agent."""
+        from harbor.models.job.config import TrialPlanEntry
+        from harbor.models.trial.config import AgentConfig, TaskConfig
+
+        job_config = meta.get("jobConfig")
+        if not isinstance(job_config, dict):
+            raise ValueError("Cannot retry planned job without launch jobConfig")
+        tasks = job_config.get("tasks")
+        agents = job_config.get("agents")
+        plan = job_config.get("trial_plan")
+        if (
+            not isinstance(tasks, list)
+            or not isinstance(agents, list)
+            or not isinstance(plan, list)
+        ):
+            raise ValueError("Cannot retry planned job without tasks, agents, and trial_plan")
+
+        task_keys = [
+            TaskConfig.model_validate(task).model_dump(mode="json") for task in tasks
+        ]
+        agent_keys = [
+            AgentConfig.model_validate(agent).model_dump(mode="json") for agent in agents
+        ]
+        planned_pairs = [
+            (entry.task_index, entry.agent_index)
+            for entry in (TrialPlanEntry.model_validate(raw) for raw in plan)
+        ]
+        if job_config.get("datasets") and any(
+            task_index >= len(task_keys) for task_index, _ in planned_pairs
+        ):
+            # Harbor can resolve dataset tasks, but this retry path cannot map
+            # their resolved indexes from the saved trial back to jobConfig.
+            raise ValueError(
+                "Dataset-backed trial_plan retry is unsupported; "
+                "generated condition jobs use explicit tasks"
+            )
+        if any(
+            task_index >= len(task_keys) or agent_index >= len(agent_keys)
+            for task_index, agent_index in planned_pairs
+        ):
+            raise ValueError(
+                "Cannot retry planned job: trial_plan indexes cannot be mapped to "
+                "configured tasks and agents"
+            )
+        retry_tasks: list[dict[str, Any]] = []
+        retry_agents: list[dict[str, Any]] = []
+        retry_plan: list[dict[str, int]] = []
+        for trial_dir in failed_dirs:
+            trial = self._read_json(trial_dir / "config.json")
+            if (
+                not isinstance(trial, dict)
+                or not isinstance(trial.get("task"), dict)
+                or not isinstance(trial.get("agent"), dict)
+            ):
+                raise ValueError(
+                    f"Cannot retry planned trial {trial_dir.name}: saved task or agent config is missing"
+                )
+            task_key = TaskConfig.model_validate(trial["task"]).model_dump(mode="json")
+            agent_key = AgentConfig.model_validate(trial["agent"]).model_dump(mode="json")
+            match = next(
+                (
+                    (task_index, agent_index)
+                    for task_index, agent_index in planned_pairs
+                    if task_keys[task_index] == task_key
+                    and agent_keys[agent_index] == agent_key
+                ),
+                None,
+            )
+            if match is None:
+                raise ValueError(
+                    f"Cannot retry planned trial {trial_dir.name}: task/agent pairing is absent from trial_plan"
+                )
+            retry_index = len(retry_plan)
+            retry_tasks.append(task_key)
+            retry_agents.append(agent_key)
+            retry_plan.append({"task_index": retry_index, "agent_index": retry_index})
+
+        retry_cfg = deepcopy(job_config)
+        retry_cfg["tasks"] = retry_tasks
+        retry_cfg["agents"] = retry_agents
+        retry_cfg["trial_plan"] = retry_plan
+        retry_cfg["n_attempts"] = 1
+        retry_cfg["n_concurrent_trials"] = min(
+            max(1, int(job_config.get("n_concurrent_trials") or 1)), len(retry_plan)
+        )
+        retry_key = f"retry-{uuid.uuid4().hex[:12]}"
+        if kind == "harbor":
+            retry_cfg["jobs_dir"] = _rel_path(
+                self.jobs_dir / job_name / "_generated" / "work" / retry_key,
+                self.repo_root,
+            )
+        retry_path = self.generated_configs_dir / f"{job_name}.{retry_key}.yaml"
+        retry_path.parent.mkdir(parents=True, exist_ok=True)
+        retry_yaml = yaml.safe_dump(retry_cfg, sort_keys=False)
+        retry_path.write_text(retry_yaml, encoding="utf-8")
+        baseline = self._planned_retry_completed_fingerprint(
+            job_name, exclude={path.name for path in failed_dirs}
+        )
+        return [
+            {
+                "index": 0,
+                "count": 1,
+                "key": retry_key,
+                "kind": kind,
+                "personaIds": sorted(
+                    {self._failed_trial_persona_id(trial_dir) for trial_dir in failed_dirs}
+                    - {""}
+                ),
+                "configPath": _rel_path(retry_path, self.repo_root),
+                "configSha256": hashlib.sha256(retry_path.read_bytes()).hexdigest(),
+                "baselineCompletedFingerprint": baseline,
+            }
+        ]
+
+    def _planned_retry_completed_fingerprint(
+        self, job_name: str, *, exclude: set[str] | None = None
+    ) -> str:
+        job_dir = self.jobs_dir / job_name
+        completed: list[tuple[str, str]] = []
+        for trial_dir in sorted(job_dir.iterdir()):
+            if (
+                not trial_dir.is_dir()
+                or trial_dir.name.startswith(("_", "."))
+                or trial_dir.name in (exclude or set())
+                or not (trial_dir / "result.json").is_file()
+            ):
+                continue
+            config_path = trial_dir / "config.json"
+            if not config_path.is_file():
+                raise ValueError(
+                    f"Cannot retry planned job: completed trial {trial_dir.name} has no config"
+                )
+            completed.append(
+                (trial_dir.name, hashlib.sha256(config_path.read_bytes()).hexdigest())
+            )
+        return hashlib.sha256(
+            json.dumps(completed, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _requeue_artifactless_planned_retry(
+        self, meta: dict[str, Any], *, job_name: str, config_path: Path
+    ) -> tuple[list[dict[str, Any]], int]:
+        from harbor.models.job.config import JobConfig
+
+        work = self._cloud_shard_work_items(job_name, config_path)
+        rows = meta["retryShards"]
+        baseline = self._planned_retry_completed_fingerprint(job_name)
+        if any(row.get("baselineCompletedFingerprint") != baseline for row in rows):
+            raise ValueError(
+                "Cannot resume planned retry: trial artifacts changed; partial retry output needs review"
+            )
+        new_rows: list[dict[str, Any]] = []
+        trial_count = 0
+        for row, (_, old_path) in zip(rows, work):
+            retry_cfg = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+            validated = JobConfig.model_validate(deepcopy(retry_cfg))
+            if not validated.trial_plan or row.get("kind") not in {"cloud", "harbor"}:
+                raise ValueError("Cannot resume planned retry: saved trial plan is invalid")
+            trial_count += len(validated.trial_plan) * validated.n_attempts
+            retry_key = f"retry-{uuid.uuid4().hex[:12]}"
+            if row["kind"] == "harbor":
+                retry_cfg["jobs_dir"] = _rel_path(
+                    self.jobs_dir / job_name / "_generated" / "work" / retry_key,
+                    self.repo_root,
+                )
+            retry_path = self.generated_configs_dir / f"{job_name}.{retry_key}.yaml"
+            retry_path.parent.mkdir(parents=True, exist_ok=True)
+            retry_path.write_text(yaml.safe_dump(retry_cfg, sort_keys=False), encoding="utf-8")
+            new_rows.append(
+                {
+                    **row,
+                    "key": retry_key,
+                    "configPath": _rel_path(retry_path, self.repo_root),
+                    "configSha256": hashlib.sha256(retry_path.read_bytes()).hexdigest(),
+                }
+            )
+        return new_rows, trial_count
+
     def failed_trial_count(self, job_name: str) -> int:
         job_dir = self.jobs_dir / job_name
         if not job_dir.is_dir():
@@ -2879,12 +3237,10 @@ class HarborJobService:
         return count
 
     def retry_failed(self, job_name: str) -> dict[str, Any]:
-        """Re-run only the failed trials in-place.
+        """Re-run failed trials while preserving successful trial artifacts.
 
-        Failed trials also write ``result.json``, so Harbor's resume would skip
-        them. We delete the failed trial dirs, reset job-level completion and
-        reporting, then re-dispatch the *identical* generated config — Harbor
-        preserves the succeeded trials and re-runs just the deleted ones.
+        Planned fanout uses each failed trial's saved task and agent in a fresh
+        worker directory. Other runs retain their existing retry behavior.
         """
         _validate_job_name(job_name)
         job_dir = self.jobs_dir / job_name
@@ -2905,10 +3261,27 @@ class HarborJobService:
             )
             is not None
         ]
-        if not failed_dirs:
-            return {"jobName": job_name, "retried": 0}
-
         meta = self._read_json(self._launch_meta_path(job_name))
+        if not failed_dirs:
+            if not isinstance(meta, dict) or "retryShards" not in meta:
+                return {"jobName": job_name, "retried": 0}
+            retry_rows = meta["retryShards"]
+            saved_config = meta.get("jobConfig")
+            saved_job_meta = meta.get("jobMeta")
+            has_planned_retry = (
+                isinstance(saved_config, dict) and bool(saved_config.get("trial_plan"))
+            ) or (
+                isinstance(saved_job_meta, dict)
+                and bool(saved_job_meta.get("condition_assignment"))
+            ) or (
+                isinstance(retry_rows, list)
+                and any(
+                    isinstance(row, dict) and row.get("baselineCompletedFingerprint")
+                    for row in retry_rows
+                )
+            )
+            if not has_planned_retry:
+                return {"jobName": job_name, "retried": 0}
         if not meta:
             raise ValueError(
                 "Cannot retry: launch metadata is unavailable for {}".format(job_name)
@@ -2919,18 +3292,96 @@ class HarborJobService:
             raise ValueError(
                 "Cannot retry: generated config is unavailable for {}".format(job_name)
             )
+        job_config = meta.get("jobConfig")
+        try:
+            generated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            generated = None
+        job_meta = meta.get("jobMeta")
+        planned = (
+            isinstance(job_config, dict) and bool(job_config.get("trial_plan"))
+        ) or (isinstance(generated, dict) and bool(generated.get("trial_plan"))) or (
+            isinstance(job_meta, dict) and bool(job_meta.get("condition_assignment"))
+        )
+        if planned:
+            if (
+                not isinstance(job_config, dict)
+                or not job_config.get("trial_plan")
+                or not isinstance(generated, dict)
+                or not generated.get("trial_plan")
+                or generated != job_config
+            ):
+                raise ValueError(
+                    "Cannot retry planned job: generated config changed since launch"
+                )
+            from harbor.models.job.config import JobConfig
+
+            validated = JobConfig.model_validate(deepcopy(job_config))
+            for entry in validated.trial_plan:
+                if entry.agent_index >= len(validated.agents):
+                    raise ValueError(
+                        f"Cannot retry planned job: trial_plan agent_index {entry.agent_index} is out of range"
+                    )
+                if entry.task_index >= len(validated.tasks):
+                    if validated.datasets:
+                        raise ValueError(
+                            "Dataset-backed trial_plan retry is unsupported; "
+                            "generated condition jobs use explicit tasks"
+                        )
+                    raise ValueError(
+                        f"Cannot retry planned job: trial_plan task_index {entry.task_index} is out of range"
+                    )
+            if failed_dirs and meta.get("retryShards"):
+                completed = sum(
+                    (job_dir / name / "result.json").is_file()
+                    for name in self._list_trial_names(job_name)
+                )
+                expected = len(validated.trial_plan) * max(1, validated.n_attempts)
+                if completed < expected:
+                    raise ValueError(
+                        "Cannot retry planned job: previous retry has missing trial results; "
+                        "partial retry output needs review"
+                    )
+        if not failed_dirs and not planned:
+            return {"jobName": job_name, "retried": 0}
 
         failed_persona_ids = {
             pid
             for trial_dir in failed_dirs
             if (pid := self._failed_trial_persona_id(trial_dir))
         }
-        retry_shards = self._retry_shards_for_failures(
-            meta, failed_persona_ids, job_name=job_name
-        )
+        compute_dispatch = meta.get("computeDispatch")
+        job_config = meta.get("jobConfig")
+        shards = meta.get("shards") if isinstance(meta.get("shards"), list) else []
+        planned_retry_kind = None
+        if compute_dispatch in {"modal_jobs", "gke_workers"}:
+            planned_retry_kind = "cloud"
+        elif any(
+            isinstance(row, dict) and row.get("kind") == "harbor" for row in shards
+        ):
+            planned_retry_kind = "harbor"
+        retried = len(failed_dirs)
+        if not failed_dirs:
+            retry_shards, retried = self._requeue_artifactless_planned_retry(
+                meta, job_name=job_name, config_path=config_path
+            )
+        elif isinstance(job_config, dict) and job_config.get("trial_plan") and planned_retry_kind:
+            retry_shards = self._planned_retry_shard(
+                meta, failed_dirs, job_name=job_name, kind=planned_retry_kind
+            )
+        else:
+            retry_shards = self._retry_shards_for_failures(
+                meta, failed_persona_ids, job_name=job_name
+            )
         if retry_shards:
             meta["retryShards"] = retry_shards
             self._persist_launch_meta(job_name, meta)
+            if planned:
+                persisted = self._read_json(self._launch_meta_path(job_name))
+                if not isinstance(persisted, dict) or persisted.get("retryShards") != retry_shards:
+                    raise ValueError(
+                        "Cannot retry planned job: retryShards could not be persisted"
+                    )
 
         for trial_dir in failed_dirs:
             shutil.rmtree(trial_dir, ignore_errors=True)
@@ -2941,7 +3392,6 @@ class HarborJobService:
             self._status_states.pop(job_name, None)
 
         plane = str(meta.get("executionPlane") or "harbor")
-        compute_dispatch = meta.get("computeDispatch")
         retry_extra_env = {str(k): str(v) for k, v in (meta.get("extraLaunchEnv") or {}).items()}
         with self._guard:
             self._launches[job_name] = HarborLaunchRecord(
@@ -2996,7 +3446,7 @@ class HarborJobService:
             else:
                 self._executor.submit(self._run_harbor, *dispatch_kwargs)
 
-        return {"jobName": job_name, "retried": len(failed_dirs)}
+        return {"jobName": job_name, "retried": retried}
 
     def _trial_debrief_fingerprint(
         self,

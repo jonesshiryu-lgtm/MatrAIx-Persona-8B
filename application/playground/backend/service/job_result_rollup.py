@@ -25,6 +25,9 @@ def expected_trial_count(job_config: dict[str, Any] | None) -> int:
     agents = [row for row in (job_config.get("agents") or []) if isinstance(row, dict)]
     tasks = [row for row in (job_config.get("tasks") or []) if isinstance(row, dict)]
     attempts = max(1, int(job_config.get("n_attempts") or 1))
+    trial_plan = job_config.get("trial_plan")
+    if isinstance(trial_plan, list) and trial_plan:
+        return len(trial_plan) * attempts
     return max(len(agents), 1) * max(len(tasks), 1) * attempts if agents else 0
 
 

@@ -10,6 +10,7 @@ from backend.service.gke_host_job import (
     GKE_REMOTE_REPO,
     GkeHostJobError,
     GkeHostJobRequest,
+    _artifact_jobs_dir,
     build_gke_job_manifest,
     encode_gke_job_config,
     gke_host_worker_script,
@@ -39,6 +40,21 @@ def test_gke_job_name_is_dns_safe_and_unique() -> None:
 def test_gke_jobs_dir_isolates_shards() -> None:
     assert gke_jobs_dir("") == "jobs"
     assert gke_jobs_dir("s0") == "jobs/s0"
+
+
+def test_planned_gke_shard_uses_its_artifact_jobs_dir() -> None:
+    planned = GkeHostJobRequest(
+        job_name="demo",
+        config_yaml="trial_plan:\n- task_index: 0\n  agent_index: 0\n",
+        env={},
+        shard_key="s0",
+    )
+    legacy = GkeHostJobRequest(
+        job_name="demo", config_yaml="trial_plan: []\n", env={}, shard_key="s0"
+    )
+
+    assert _artifact_jobs_dir(planned) == "jobs/s0"
+    assert _artifact_jobs_dir(legacy) == "jobs"
 
 
 def test_encode_gke_job_config_gzips_when_large(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -118,6 +134,58 @@ def test_materialize_gke_artifacts_preserves_compute_json(tmp_path: Path) -> Non
     text = (merged / "survey__abc" / "result.json").read_text(encoding="utf-8")
     assert "/matraix/jobs/demo" not in text
     assert str(merged.resolve()) in text
+
+
+def test_retry_gke_artifacts_rewrite_isolated_job_path(tmp_path: Path) -> None:
+    src = tmp_path / "remote" / "demo"
+    trial = src / "survey__retry"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        '{"trial_uri": "file:///matraix/jobs/retry-123/demo/survey__retry"}',
+        encoding="utf-8",
+    )
+    result = ModalHostJobResult(
+        exit_code=0,
+        artifact_tar=pack_job_dir(src),
+        jobs_dir="jobs/retry-123",
+    )
+
+    merged = materialize_gke_artifacts(
+        result, jobs_dir=tmp_path / "jobs", job_name="demo"
+    )
+
+    text = (merged / "survey__retry" / "result.json").read_text()
+    assert str((merged / "survey__retry").resolve()) in text
+    assert "/matraix/jobs/retry-123" not in text
+
+
+def test_planned_gke_shard_artifacts_rewrite_source_path(tmp_path: Path) -> None:
+    src = tmp_path / "remote" / "demo"
+    trial = src / "survey__planned"
+    trial.mkdir(parents=True)
+    (trial / "result.json").write_text(
+        '{"trial_uri": "file:///matraix/jobs/s0/demo/survey__planned"}',
+        encoding="utf-8",
+    )
+    request = GkeHostJobRequest(
+        job_name="demo",
+        config_yaml="trial_plan:\n- task_index: 0\n  agent_index: 0\n",
+        env={},
+        shard_key="s0",
+    )
+    result = ModalHostJobResult(
+        exit_code=0,
+        artifact_tar=pack_job_dir(src),
+        jobs_dir=_artifact_jobs_dir(request),
+    )
+
+    merged = materialize_gke_artifacts(
+        result, jobs_dir=tmp_path / "jobs", job_name="demo"
+    )
+
+    text = (merged / "survey__planned" / "result.json").read_text()
+    assert str((merged / "survey__planned").resolve()) in text
+    assert "/matraix/jobs/s0" not in text
 
 
 def test_materialize_gke_artifacts_requires_tree(tmp_path: Path) -> None:

@@ -11,6 +11,22 @@ def test_expected_trial_count() -> None:
     assert expected_trial_count({"agents": [{}, {}, {}], "tasks": [{}], "n_attempts": 1}) == 3
 
 
+def test_expected_trial_count_uses_explicit_plan_with_attempts() -> None:
+    config = {
+        "agents": [{}, {}, {}],
+        "tasks": [{}, {}],
+        "n_attempts": 2,
+        "trial_plan": [
+            {"task_index": 0, "agent_index": 0},
+            {"task_index": 1, "agent_index": 2},
+        ],
+    }
+
+    assert expected_trial_count(config) == 4
+    assert expected_trial_count({**config, "trial_plan": []}) == 12
+    assert expected_trial_count({key: value for key, value in config.items() if key != "trial_plan"}) == 12
+
+
 def test_synthesize_job_result_counts_trials(tmp_path: Path) -> None:
     job_dir = tmp_path / "jobs" / "demo"
     ok = job_dir / "t_ok"

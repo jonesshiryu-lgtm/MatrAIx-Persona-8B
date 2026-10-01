@@ -85,10 +85,24 @@ def launch_kwargs_from_job_config(
     execution_plane: str | None = None,
     extra_launch_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Rebuild ``HarborJobService.launch`` kwargs from a generated recipe."""
+    """Build launch kwargs while preserving the generated Harbor job YAML."""
     sidecar = load_job_sidecar(config_path)
     job = load_job_yaml(config_path)
+    trial_plan = job.get("trial_plan")
+    if "trial_plan" in job and not isinstance(trial_plan, list):
+        raise ValueError("trial_plan must be a list")
+    has_trial_plan = bool(trial_plan)
+    if "condition_assignment" in sidecar and not has_trial_plan:
+        raise ValueError("condition assignment requires a nonempty trial_plan in job YAML")
+    if has_trial_plan and sidecar:
+        # The generator writes _job_meta to the sidecar, outside Harbor YAML.
+        # Keep its assignment manifest with the compiled config for launch metadata.
+        job["_job_meta"] = sidecar
     task_path = str(sidecar.get("task") or "").strip()
+    if not task_path and has_trial_plan:
+        tasks = job.get("tasks")
+        if isinstance(tasks, list) and tasks and isinstance(tasks[0], dict):
+            task_path = str(tasks[0].get("path") or "").strip()
     if not task_path:
         raise ValueError(
             "this job YAML has no sidecar task; re-run "
@@ -120,6 +134,8 @@ def launch_kwargs_from_job_config(
         "compute_family": compute_family,
         "execution_plane": execution_plane,
     }
+    if has_trial_plan:
+        launch_kwargs["compiled_job_config"] = job
     if persona_ids:
         launch_kwargs["persona_ids"] = persona_ids
     elif sample_size:

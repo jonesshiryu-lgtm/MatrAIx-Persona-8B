@@ -312,6 +312,34 @@ class Job:
         return task_configs
 
     def _init_trial_configs(self):
+        if self.config.trial_plan:
+            task_agent_pairs = []
+            for entry in self.config.trial_plan:
+                if entry.task_index >= len(self._task_configs):
+                    raise ValueError(
+                        f"trial_plan task_index {entry.task_index} is out of range "
+                        f"for {len(self._task_configs)} resolved tasks."
+                    )
+                if entry.agent_index >= len(self.config.agents):
+                    raise ValueError(
+                        f"trial_plan agent_index {entry.agent_index} is out of range "
+                        f"for {len(self.config.agents)} configured agents."
+                    )
+                task_agent_pairs.append(
+                    (
+                        self._task_configs[entry.task_index],
+                        self.config.agents[entry.agent_index],
+                    )
+                )
+        else:
+            task_agent_pairs = [
+                (task_config, agent_config)
+                for task_config in self._task_configs
+                for agent_config in self.config.agents
+                # Put agent on the inside of the nested loop to potentially
+                # distribute model providers and improve rate limit usage.
+            ]
+
         self._trial_configs = [
             TrialConfig(
                 task=task_config,
@@ -329,10 +357,7 @@ class Job:
                 job_id=self._id,
             )
             for _ in range(self.config.n_attempts)
-            for task_config in self._task_configs
-            for agent_config in self.config.agents
-            # Put agent on the inside of the nested loop to potentially distribute
-            # model providers and improve rate limit usage.
+            for task_config, agent_config in task_agent_pairs
         ]
 
     @property

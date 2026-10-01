@@ -10,8 +10,31 @@ import pytest
 
 from matraix.job_run import (
     launch_kwargs_from_job_config,
+    load_job_sidecar,
+    load_job_yaml,
     should_dispatch_via_playground,
     wait_for_harbor_job,
+)
+
+
+_PLANNED_YAML = (
+    "job_name: cli-survey\n"
+    "jobs_dir: jobs\n"
+    "n_concurrent_trials: 3\n"
+    "tasks:\n"
+    "  - path: application/tasks/survey_a_first\n"
+    "  - path: application/tasks/survey_b_first\n"
+    "agents:\n"
+    "  - name: persona-json-survey\n"
+    "    kwargs: {persona_path: persona_0001.yaml, survey_task_path: application/tasks/survey_a_first}\n"
+    "  - name: persona-json-survey\n"
+    "    kwargs: {persona_path: persona_0002.yaml, survey_task_path: application/tasks/survey_b_first}\n"
+    "  - name: persona-json-survey\n"
+    "    kwargs: {persona_path: persona_0003.yaml, survey_task_path: application/tasks/survey_a_first}\n"
+    "trial_plan:\n"
+    "  - {task_index: 0, agent_index: 0}\n"
+    "  - {task_index: 1, agent_index: 1}\n"
+    "  - {task_index: 0, agent_index: 2}\n"
 )
 
 
@@ -131,6 +154,62 @@ def test_launch_kwargs_from_sidecar_and_yaml(tmp_path: Path) -> None:
     assert kwargs["persona_model"] == "anthropic/claude-haiku-4-5"
     assert kwargs["compute_family"] == "modal"
     assert kwargs["seed"] == 42
+    assert "compiled_job_config" not in kwargs
+
+
+@pytest.mark.parametrize("family", ["modal", "gcp"])
+def test_planned_yaml_without_single_sidecar_task_is_forwarded(
+    tmp_path: Path, family: str
+) -> None:
+    config = _write_recipe(
+        tmp_path,
+        yaml_body=_PLANNED_YAML,
+        sidecar={
+            "trial_profile": "json_survey",
+            "computeFamily": family,
+            "condition_assignment": {"seed": 7},
+        },
+    )
+
+    kwargs = launch_kwargs_from_job_config(config, compute_family=family)
+
+    assert kwargs["task_path"] == "application/tasks/survey_a_first"
+    compiled = kwargs["compiled_job_config"]
+    assert {key: value for key, value in compiled.items() if key != "_job_meta"} == load_job_yaml(config)
+    assert compiled["_job_meta"] == load_job_sidecar(config)
+    assert len(kwargs["compiled_job_config"]["tasks"]) == 2
+    assert len(kwargs["compiled_job_config"]["agents"]) == 3
+    assert kwargs["compiled_job_config"]["trial_plan"] == [
+        {"task_index": 0, "agent_index": 0},
+        {"task_index": 1, "agent_index": 1},
+        {"task_index": 0, "agent_index": 2},
+    ]
+
+
+@pytest.mark.parametrize(
+    "yaml_body",
+    [
+        "job_name: condition-job\ntasks: [{path: task-a}]\n",
+        "job_name: condition-job\ntrial_plan: []\n",
+        "job_name: condition-job\ntrial_plan: null\n",
+        "job_name: condition-job\ntrial_plan: {}\n",
+        "job_name: condition-job\ntrial_plan: [\n",
+    ],
+)
+def test_condition_sidecar_rejects_missing_or_malformed_plan(
+    tmp_path: Path, yaml_body: str
+) -> None:
+    config = _write_recipe(
+        tmp_path,
+        yaml_body=yaml_body,
+        sidecar={
+            "task": "application/tasks/example-survey_product-feedback",
+            "condition_assignment": {"seed": 7},
+        },
+    )
+
+    with pytest.raises(ValueError, match="trial_plan"):
+        launch_kwargs_from_job_config(config, compute_family="modal")
 
 
 def test_launch_kwargs_requires_sidecar_task(tmp_path: Path) -> None:
@@ -165,8 +244,10 @@ def test_wait_for_harbor_job_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
         wait_for_harbor_job(Fake(), "job-1", poll_s=0, timeout_s=0)
 
 
+@pytest.mark.parametrize("family", ["modal", "gcp"])
+@pytest.mark.parametrize("planned", [False, True])
 def test_run_via_harbor_job_service_forwards_launch_kwargs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str, planned: bool
 ) -> None:
     import types
 
@@ -174,14 +255,20 @@ def test_run_via_harbor_job_service_forwards_launch_kwargs(
 
     config = _write_recipe(
         tmp_path,
+        yaml_body=_PLANNED_YAML if planned else None,
         sidecar={
-            "task": "application/tasks/example-survey_product-feedback",
-            "selected_persona_ids": ["0042"],
+            **(
+                {"task": "application/tasks/example-survey_product-feedback"}
+                if not planned
+                else {}
+            ),
+            "selected_persona_ids": ["0001", "0002", "0003"] if planned else ["0042"],
             "seed": 7,
             "execution_mode": "auto",
             "trial_profile": "json_survey",
-            "computeFamily": "modal",
+            "computeFamily": family,
             "retrieval": {"pool": "persona/datasets/matraix-persona-dev-sample"},
+            **({"condition_assignment": {"seed": 7}} if planned else {}),
         },
     )
     captured: dict[str, object] = {}
@@ -218,12 +305,18 @@ def test_run_via_harbor_job_service_forwards_launch_kwargs(
     code = run_via_harbor_job_service(
         config_path=config,
         repo_root=tmp_path,
-        compute_family="modal",
+        compute_family=family,
         execution_plane="harbor",
     )
     assert code == 0
-    assert captured["compute_family"] == "modal"
-    assert captured["persona_ids"] == ["0042"]
+    assert captured["compute_family"] == family
+    assert captured["persona_ids"] == (["0001", "0002", "0003"] if planned else ["0042"])
     assert captured["job_name"] == "cli-survey"
     assert captured["execution_plane"] == "harbor"
+    if planned:
+        compiled = captured["compiled_job_config"]
+        assert {key: value for key, value in compiled.items() if key != "_job_meta"} == load_job_yaml(config)
+        assert compiled["_job_meta"] == load_job_sidecar(config)
+    else:
+        assert "compiled_job_config" not in captured
     assert captured["shutdown"] is True

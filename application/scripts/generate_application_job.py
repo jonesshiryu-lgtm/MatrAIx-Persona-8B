@@ -77,6 +77,22 @@ def _default_job_name(
     return f"{task_slug}{mode_suffix}-n{sample_size}"
 
 
+def _parse_condition_args(raw_conditions: list[str]) -> list[dict[str, str]]:
+    conditions: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for raw in raw_conditions:
+        condition_id, separator, task = raw.partition("=")
+        condition_id = condition_id.strip()
+        task = task.strip()
+        if not separator or not condition_id or not task:
+            raise ValueError(f"invalid --condition {raw!r}; expected ID=TASK")
+        if condition_id in seen_ids:
+            raise ValueError(f"duplicate --condition id: {condition_id}")
+        seen_ids.add(condition_id)
+        conditions.append({"id": condition_id, "task": task})
+    return conditions
+
+
 def format_run_instructions(
     *,
     config_display: str,
@@ -258,6 +274,27 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed (default: strategy seed, else 42)")
     parser.add_argument(
+        "--condition",
+        action="append",
+        default=[],
+        metavar="ID=TASK",
+        help="Survey condition id and task path. Repeat for each condition.",
+    )
+    parser.add_argument(
+        "--block-by",
+        action="append",
+        default=[],
+        metavar="FIELD",
+        help="Block condition assignment by persona field. Repeat or comma-separate.",
+    )
+    parser.add_argument(
+        "--assignment-seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Condition assignment seed (default: resolved persona sampling seed).",
+    )
+    parser.add_argument(
         "--execution-mode",
         choices=sorted(_EXECUTION_MODES),
         default="auto",
@@ -337,6 +374,15 @@ def main() -> None:
         parser.error("use either --strategy or --no-strategy, not both")
     if args.n_concurrent_trials < 1:
         parser.error("--n-concurrent-trials must be >= 1")
+    try:
+        conditions = _parse_condition_args(args.condition)
+    except ValueError as exc:
+        parser.error(str(exc))
+    block_by = parse_stratify_field_args(args.block_by)
+    if not conditions and (args.block_by or args.assignment_seed is not None):
+        parser.error("--block-by and --assignment-seed require --condition")
+    if args.block_by and not block_by:
+        parser.error("--block-by requires a non-empty field")
 
     try:
         plan = build_retrieval_plan(
@@ -411,6 +457,15 @@ def main() -> None:
             "timeout_multiplier": 1.0,
         },
     }
+    if conditions:
+        assignment: dict[str, object] = {
+            "method": "blocked_randomization",
+            "block_by": block_by,
+        }
+        if args.assignment_seed is not None:
+            assignment["seed"] = args.assignment_seed
+        spec["conditions"] = conditions
+        spec["assignment"] = assignment
     if args.cua_backend:
         spec["cua_backend"] = args.cua_backend
 
@@ -432,7 +487,12 @@ def main() -> None:
     if execution_mode == "force_docker" and not args.cua_backend:
         spec["job"]["environment"] = {"type": "docker", "delete": True}
 
-    job_config = build_application_job_config(spec, repo_root=REPO_ROOT)
+    try:
+        job_config = build_application_job_config(spec, repo_root=REPO_ROOT)
+    except (FileNotFoundError, ValueError) as exc:
+        if conditions:
+            parser.error(str(exc))
+        raise
     meta = job_config.pop("_job_meta")
     meta.update(
         {

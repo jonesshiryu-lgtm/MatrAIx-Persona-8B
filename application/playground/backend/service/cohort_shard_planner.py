@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -266,6 +266,11 @@ def _slice_job_config(
     per_shard_concurrent: Sequence[int] | None = None,
 ) -> list[tuple[CohortShard, dict[str, Any]]]:
     planned = plan_cohort_shards(ids, shard_size=shard_size)
+    trial_plan = job_config.get("trial_plan") or []
+    for entry in trial_plan:
+        agent_index = entry["agent_index"]
+        if not 0 <= agent_index < len(agents):
+            raise ValueError(f"trial_plan agent_index {agent_index} is out of range")
     shards: list[tuple[CohortShard, dict[str, Any]]] = []
     for index, shard in enumerate(planned):
         config = copy.deepcopy(job_config)
@@ -273,11 +278,26 @@ def _slice_job_config(
             copy.deepcopy(agent)
             for agent in agents[shard.offset : shard.offset + shard.limit]
         ]
+        if trial_plan:
+            shard_plan = [
+                {**copy.deepcopy(entry), "agent_index": entry["agent_index"] - shard.offset}
+                for entry in trial_plan
+                if shard.offset <= entry["agent_index"] < shard.offset + shard.limit
+            ]
+            if not shard_plan:
+                # An empty plan would make Harbor run the Cartesian product.
+                continue
+            config["trial_plan"] = shard_plan
         if per_shard_concurrent is not None and index < len(per_shard_concurrent):
             concurrent = max(0, int(per_shard_concurrent[index]))
             if concurrent:
                 config["n_concurrent_trials"] = concurrent
         shards.append((shard, config))
+    if trial_plan and len(shards) != len(planned):
+        shards = [
+            (replace(shard, shard_index=index, shard_count=len(shards)), config)
+            for index, (shard, config) in enumerate(shards)
+        ]
     return shards
 
 
@@ -361,6 +381,22 @@ def plan_job_shards(
         shard_size=layout.shard_size,
         per_shard_concurrent=layout.per_shard_concurrent,
     )
+    if job_config.get("trial_plan"):
+        active_agents = [
+            len({entry["agent_index"] for entry in config["trial_plan"]})
+            for _, config in shards
+        ]
+        concurrent = _allocate_concurrency(
+            layout.effective_parallel, resolved_pack, active_agents
+        )
+        for (_, config), limit in zip(shards, concurrent):
+            config["n_concurrent_trials"] = limit
+        layout = replace(
+            layout,
+            effective_parallel=sum(concurrent),
+            worker_count=len(shards),
+            per_shard_concurrent=concurrent,
+        )
     return JobShardPlan(layout=layout, shards=shards)
 
 

@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+import yaml
+
 from backend.service.modal_host_job import (
     HARBOR_MODULE_COMMAND,
     MODAL_REMOTE_REPO,
@@ -119,6 +121,14 @@ def gke_jobs_dir(shard_key: str = "") -> str:
     shard = (shard_key or "").strip()
     if shard:
         return "jobs/{}".format(shard)
+    return "jobs"
+
+
+def _artifact_jobs_dir(request: GkeHostJobRequest) -> str:
+    """Locate planned trial artifacts while preserving legacy path rewriting."""
+    loaded = yaml.safe_load(request.config_yaml)
+    if isinstance(loaded, dict) and loaded.get("trial_plan"):
+        return gke_jobs_dir(request.shard_key)
     return "jobs"
 
 
@@ -357,6 +367,7 @@ class SdkGkeHostJobRunner:
             artifact_tar=artifact,
             error=error,
             volume_path=request.job_name,
+            jobs_dir=_artifact_jobs_dir(request),
         )
 
     def cleanup(self, request: GkeHostJobRequest) -> None:
@@ -647,6 +658,7 @@ def materialize_gke_artifacts(
             jobs_dir=jobs_dir,
             job_name=job_name,
             remote_repo=GKE_REMOTE_REPO,
+            remote_jobs_dir=result.jobs_dir,
         )
     else:
         rewrite_job_artifact_paths(
@@ -654,6 +666,7 @@ def materialize_gke_artifacts(
             remote_repo=GKE_REMOTE_REPO,
             local_job_dir=dest,
             job_name=job_name,
+            remote_jobs_dir=result.jobs_dir,
         )
         if not any(path.name != "compute.json" for path in dest.iterdir()):
             raise GkeHostJobError(

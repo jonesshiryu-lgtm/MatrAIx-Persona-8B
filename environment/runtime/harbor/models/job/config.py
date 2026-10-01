@@ -312,9 +312,14 @@ class RetryConfig(BaseModel):
     )
 
 
+class TrialPlanEntry(BaseModel):
+    task_index: int = Field(ge=0)
+    agent_index: int = Field(ge=0)
+
+
 class JobConfig(BaseModel):
-    # If replay-affecting fields are added or changed here, update JobLock in
-    # harbor.models.job.lock so lock.json records the same resolved run input.
+    # Replay-affecting fields must be represented in JobLock, either directly
+    # or through the resolved TrialConfigs recorded as TrialLocks.
     job_name: str = Field(
         default_factory=lambda: datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     )
@@ -335,6 +340,7 @@ class JobConfig(BaseModel):
     agents: list[AgentConfig] = Field(default_factory=lambda: [AgentConfig()])
     datasets: list[DatasetConfig] = Field(default_factory=list)
     tasks: list[TaskConfig] = Field(default_factory=list)
+    trial_plan: list[TrialPlanEntry] = Field(default_factory=list)
     artifacts: list[str | ArtifactConfig] = Field(default_factory=list)
     extra_instruction_paths: list[Path] = Field(default_factory=list)
     plugins: list[PluginConfig] = Field(default_factory=list)

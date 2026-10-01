@@ -117,6 +117,10 @@ class LocalDistributedHarborCoordinator:
         self.job_dir.mkdir(parents=True, exist_ok=True)
         self.generated_dir.mkdir(parents=True, exist_ok=True)
         self.manifests_dir.mkdir(parents=True, exist_ok=True)
+        if self.job_config.get("trial_plan"):
+            existing_config = self._read_json(self.job_dir / "config.json")
+            if existing_config is not None and existing_config != self.job_config:
+                raise ValueError("planned job config changed during local distributed resume")
         (self.job_dir / "config.json").write_text(_json_dump(self.job_config), encoding="utf-8")
         manifests = self._materialize_trial_manifests()
         self._write_state(manifests, status="running", retries=0)
@@ -124,11 +128,16 @@ class LocalDistributedHarborCoordinator:
 
         retries = 0
         concurrency = int(self.job_config.get("n_concurrent_trials") or 1)
-        max_workers = max(1, min(concurrency, len(manifests)))
+        pending = (
+            [manifest for manifest in manifests if not (manifest.trial_dir / "result.json").is_file()]
+            if self.job_config.get("trial_plan")
+            else manifests
+        )
+        max_workers = max(1, min(concurrency, len(pending)))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
                 pool.submit(self._run_manifest_with_retries, manifest): manifest
-                for manifest in manifests
+                for manifest in pending
             }
             for future in as_completed(futures):
                 retries += int(future.result())
@@ -140,8 +149,13 @@ class LocalDistributedHarborCoordinator:
         return {"trialCount": len(manifests), "retries": retries, "jobDir": str(self.job_dir)}
 
     def _materialize_trial_manifests(self) -> list[LocalDistributedTrialManifest]:
+        planned_configs = self._planned_trial_configs()
+        if self.job_config.get("trial_plan"):
+            existing = self._existing_planned_manifests(planned_configs)
+            if existing is not None:
+                return existing
         manifests: list[LocalDistributedTrialManifest] = []
-        for trial_config in self._planned_trial_configs():
+        for trial_config in planned_configs:
             trial_name = str(trial_config["trial_name"])
             trial_dir = self.job_dir / trial_name
             manifest_path = self.manifests_dir / f"{trial_name}.json"
@@ -157,6 +171,64 @@ class LocalDistributedHarborCoordinator:
             )
         return manifests
 
+    def _existing_planned_manifests(
+        self, planned_configs: list[dict[str, Any]]
+    ) -> list[LocalDistributedTrialManifest] | None:
+        if not self.state_path.is_file():
+            return None
+        state = self._read_json(self.state_path)
+        names = state.get("trialNames") if state is not None else None
+        if not isinstance(names, list) or len(names) != len(planned_configs):
+            raise ValueError("planned job trial manifest count changed during resume")
+
+        manifests: list[LocalDistributedTrialManifest] = []
+        existing_job_id: str | None = None
+        seen_names: set[str] = set()
+        for name, planned_config in zip(names, planned_configs):
+            if (
+                not isinstance(name, str)
+                or not name
+                or Path(name).name != name
+                or name in seen_names
+            ):
+                raise ValueError("planned job has an invalid persisted trial name")
+            seen_names.add(name)
+            manifest_path = self.manifests_dir / f"{name}.json"
+            existing_config = self._read_json(manifest_path)
+            if existing_config is None or existing_config.get("trial_name") != name:
+                raise ValueError(f"planned job trial manifest is missing: {name}")
+            identity_fields = {"trial_name", "job_id"}
+            expected = {
+                key: value
+                for key, value in planned_config.items()
+                if key not in identity_fields
+            }
+            actual = {
+                key: value
+                for key, value in existing_config.items()
+                if key not in identity_fields
+            }
+            if actual != expected:
+                raise ValueError(f"planned job trial pairing changed during resume: {name}")
+            job_id = str(existing_config.get("job_id") or "")
+            if not job_id or (existing_job_id is not None and job_id != existing_job_id):
+                raise ValueError("planned job trial manifests have inconsistent job ids")
+            existing_job_id = job_id
+            trial_dir = self.job_dir / name
+            if not (trial_dir / "result.json").is_file():
+                self._prime_trial_dir(trial_dir, existing_config)
+            manifests.append(
+                LocalDistributedTrialManifest(
+                    trial_name=name,
+                    trial_dir=trial_dir,
+                    manifest_path=manifest_path,
+                    config=existing_config,
+                )
+            )
+        if existing_job_id is not None:
+            self.job_id = existing_job_id
+        return manifests
+
     def _planned_trial_configs(self) -> list[dict[str, Any]]:
         tasks = list(self.job_config.get("tasks") or [])
         agents = list(self.job_config.get("agents") or [])
@@ -164,29 +236,41 @@ class LocalDistributedHarborCoordinator:
             raise ValueError("local distributed Harbor requires at least one explicit task")
         if self.job_config.get("datasets"):
             raise ValueError("local distributed Harbor does not support dataset-backed jobs")
+        plan = self.job_config.get("trial_plan") or []
+        if plan:
+            pairs = []
+            for entry in plan:
+                task_index = entry["task_index"]
+                agent_index = entry["agent_index"]
+                if not 0 <= task_index < len(tasks):
+                    raise ValueError(f"trial_plan task_index {task_index} is out of range")
+                if not 0 <= agent_index < len(agents):
+                    raise ValueError(f"trial_plan agent_index {agent_index} is out of range")
+                pairs.append((tasks[task_index], agents[agent_index]))
+        else:
+            pairs = [(task, agent) for task in tasks for agent in agents]
         job_id = self.job_id
         payloads: list[dict[str, Any]] = []
         for _ in range(int(self.job_config.get("n_attempts") or 1)):
-            for task in tasks:
-                for agent in agents:
-                    payloads.append(
-                        {
-                            "task": task,
-                            "trial_name": _trial_name(task),
-                            "trials_dir": str(self.job_dir),
-                            "timeout_multiplier": self.job_config.get("timeout_multiplier", 1.0),
-                            "agent_timeout_multiplier": self.job_config.get("agent_timeout_multiplier"),
-                            "verifier_timeout_multiplier": self.job_config.get("verifier_timeout_multiplier"),
-                            "agent_setup_timeout_multiplier": self.job_config.get("agent_setup_timeout_multiplier"),
-                            "environment_build_timeout_multiplier": self.job_config.get("environment_build_timeout_multiplier"),
-                            "agent": agent,
-                            "environment": self.job_config.get("environment") or {},
-                            "verifier": self.job_config.get("verifier") or {},
-                            "artifacts": self.job_config.get("artifacts") or [],
-                            "extra_instruction_paths": self.job_config.get("extra_instruction_paths") or [],
-                            "job_id": job_id,
-                        }
-                    )
+            for task, agent in pairs:
+                payloads.append(
+                    {
+                        "task": task,
+                        "trial_name": _trial_name(task),
+                        "trials_dir": str(self.job_dir),
+                        "timeout_multiplier": self.job_config.get("timeout_multiplier", 1.0),
+                        "agent_timeout_multiplier": self.job_config.get("agent_timeout_multiplier"),
+                        "verifier_timeout_multiplier": self.job_config.get("verifier_timeout_multiplier"),
+                        "agent_setup_timeout_multiplier": self.job_config.get("agent_setup_timeout_multiplier"),
+                        "environment_build_timeout_multiplier": self.job_config.get("environment_build_timeout_multiplier"),
+                        "agent": agent,
+                        "environment": self.job_config.get("environment") or {},
+                        "verifier": self.job_config.get("verifier") or {},
+                        "artifacts": self.job_config.get("artifacts") or [],
+                        "extra_instruction_paths": self.job_config.get("extra_instruction_paths") or [],
+                        "job_id": job_id,
+                    }
+                )
         return payloads
 
     def _invoke_worker(self, manifest: LocalDistributedTrialManifest) -> int:
