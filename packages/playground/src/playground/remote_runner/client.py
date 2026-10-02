@@ -111,6 +111,9 @@ class RemoteRunnerClient:
     def get_artifact(self, run_id: str, name: str) -> Any:
         return self._request("GET", "/v1/runs/{}/artifacts/{}".format(run_id, name))
 
+    def get_artifact_manifest(self, run_id: str) -> Any:
+        return self.get_artifact(run_id, "artifact_manifest.json")
+
     def health(self) -> dict[str, Any]:
         if not self.base_url:
             raise RemoteRunError("REMOTE_RUNNER_API_URL is not configured")

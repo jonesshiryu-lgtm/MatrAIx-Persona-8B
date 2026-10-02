@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -134,3 +135,136 @@ def run_harbor_job(
     if exit_code != 0:
         raise RuntimeError("harbor run exited with code {}".format(exit_code))
     return result
+
+
+_SKIP_DIR_NAMES = frozenset(
+    {
+        "_generated",
+        "agent",
+        "artifacts",
+        "verifier",
+        "logs",
+        "__pycache__",
+    }
+)
+
+
+def resolve_job_dir(payload: dict[str, Any], *, repo_root: Path | None = None) -> Path:
+    """Resolve the directory holding trial runs for a Harbor job."""
+    if repo_root is None:
+        repo_root = resolve_repo_root(payload)
+    if payload.get("jobDir"):
+        raw_job_dir = Path(str(payload["jobDir"]))
+        return raw_job_dir if raw_job_dir.is_absolute() else (repo_root / raw_job_dir)
+    jobs_dir_val = str(payload.get("jobsDir") or "jobs").strip() or "jobs"
+    jobs_path = Path(jobs_dir_val)
+    if not jobs_path.is_absolute():
+        jobs_path = repo_root / jobs_path
+    job_name = str(payload.get("jobName") or "remote-job").strip() or "remote-job"
+    return jobs_path / job_name
+
+
+def discover_harbor_job_artifacts(payload: dict[str, Any]) -> dict[str, Any]:
+    """Discover trial JSON task outputs under `artifacts/app/output/`.
+
+    Registers:
+    - Canonical relative path from job_dir (e.g. `<trial>/artifacts/app/output/<name>.json`)
+    - Trial-scoped shortcut (e.g. `<trial>/<name>.json`)
+    - Trial-relative path if only a single trial exists (e.g. `artifacts/app/output/<name>.json`)
+    - Basename shortcut only when the filename is unique across all trials
+    - `artifact_manifest.json` listing the canonical relative paths
+    """
+    repo_root = resolve_repo_root(payload)
+    job_dir = resolve_job_dir(payload, repo_root=repo_root)
+    job_name = str(payload.get("jobName") or "remote-job").strip() or "remote-job"
+
+    if not job_dir.is_dir():
+        manifest = {
+            "jobName": job_name,
+            "artifacts": [],
+            "entries": [],
+            "trials": {},
+        }
+        return {"artifact_manifest.json": manifest}
+
+    trial_dirs: list[Path] = []
+    for child in sorted(job_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.name.startswith(".") or child.name.startswith("_") or child.name in _SKIP_DIR_NAMES:
+            continue
+        trial_dirs.append(child)
+
+    # Support flat single-trial layout where artifacts/app/output is placed directly in job_dir
+    if not trial_dirs and (job_dir / "artifacts" / "app" / "output").is_dir():
+        trial_dirs.append(job_dir)
+
+    discovered: list[tuple[str, Path, Path, str, Any]] = []
+    for t_dir in trial_dirs:
+        output_dir = t_dir / "artifacts" / "app" / "output"
+        if not output_dir.is_dir():
+            for fallback in (t_dir / "artifacts" / "output", t_dir / "output"):
+                if fallback.is_dir():
+                    output_dir = fallback
+                    break
+        if not output_dir.is_dir():
+            continue
+
+        trial_name = t_dir.name if t_dir != job_dir else "default"
+        for json_path in sorted(p for p in output_dir.rglob("*.json") if p.is_file()):
+            try:
+                content = json.loads(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            try:
+                rel_to_job = str(json_path.relative_to(job_dir))
+            except ValueError:
+                rel_to_job = f"{trial_name}/artifacts/app/output/{json_path.name}"
+            discovered.append((trial_name, t_dir, json_path, rel_to_job, content))
+
+    basename_counts: dict[str, int] = {}
+    for _, _, json_path, _, _ in discovered:
+        basename_counts[json_path.name] = basename_counts.get(json_path.name, 0) + 1
+
+    artifacts: dict[str, Any] = {}
+
+    # 1. Register canonical relative path from job_dir
+    for _, _, _, rel_to_job, content in discovered:
+        artifacts[rel_to_job] = content
+
+    # 2. Register trial-scoped shortcut: <trial_name>/<filename>
+    for trial_name, _, json_path, _, content in discovered:
+        trial_shortcut = f"{trial_name}/{json_path.name}"
+        if trial_shortcut not in artifacts:
+            artifacts[trial_shortcut] = content
+
+    # 3. If single trial, register trial-relative path (artifacts/app/output/<name>.json)
+    if len(trial_dirs) == 1:
+        for _, t_dir, json_path, _, content in discovered:
+            try:
+                rel_to_trial = str(json_path.relative_to(t_dir))
+                artifacts[rel_to_trial] = content
+            except ValueError:
+                pass
+
+    # 4. Expose basename shortcut ONLY when unique across all trials
+    for _, _, json_path, _, content in discovered:
+        if basename_counts[json_path.name] == 1:
+            artifacts[json_path.name] = content
+
+    # 5. Build artifact_manifest.json
+    canonical_names = [item[3] for item in discovered]
+    trial_entries: dict[str, list[str]] = {}
+    for trial_name, _, _, rel_to_job, _ in discovered:
+        trial_entries.setdefault(trial_name, []).append(rel_to_job)
+
+    manifest = {
+        "jobName": job_name,
+        "artifacts": canonical_names,
+        "entries": canonical_names,
+        "trials": trial_entries,
+    }
+    artifacts["artifact_manifest.json"] = manifest
+
+    return artifacts
+

@@ -24,6 +24,16 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(200, {"status": "ok"})
             return
+        if self.path.startswith("/v1/runs/") and "/artifacts/" in self.path:
+            name = self.path.split("/artifacts/", 1)[-1]
+            if name == "artifact_manifest.json":
+                self._json(200, {"jobName": "demo", "artifacts": ["trial_001/survey_result.json"]})
+                return
+            if name == "survey_result.json":
+                self._json(200, {"result": "ok"})
+                return
+            self._json(404, {"detail": "artifact not found"})
+            return
         if self.path.startswith("/v1/runs/") and "/artifacts/" not in self.path:
             run_id = self.path.split("/")[-1]
             payload = self.runs.get(run_id)
@@ -81,3 +91,14 @@ def test_remote_runner_client_requires_base_url() -> None:
     client = RemoteRunnerClient(base_url="")
     with pytest.raises(RemoteRunError):
         client.create_run(task_type="harbor_job", payload={})
+
+
+def test_remote_runner_client_get_artifact_and_manifest(remote_server: str) -> None:
+    client = RemoteRunnerClient(base_url=remote_server)
+    manifest = client.get_artifact_manifest("run_test")
+    assert manifest["jobName"] == "demo"
+    assert manifest["artifacts"] == ["trial_001/survey_result.json"]
+
+    artifact = client.get_artifact("run_test", "survey_result.json")
+    assert artifact == {"result": "ok"}
+

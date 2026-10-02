@@ -225,6 +225,12 @@ The worker must have access to the same repository checkout (tasks, personas,
 - `GET /v1/runs/{id}`
 - `GET /v1/runs/{id}/artifacts/{name}`
 
+When `taskType=harbor_job` runs successfully, the remote runner automatically exposes:
+- `harbor_job_result.json`
+- `artifact_manifest.json` listing discovered trial artifact relative paths
+- Deterministic relative artifact paths (e.g. `<trial>/artifacts/app/output/<name>.json` and `<trial>/<name>.json`)
+- Basename shortcut (e.g. `survey_result.json`) when unique across all trials in the job (such as single-persona Survey)
+
 Primary payload fields for `harbor_job`:
 
 - `jobName`

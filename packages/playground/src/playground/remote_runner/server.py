@@ -17,7 +17,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from playground.remote_runner.dispatch import run_harbor_job
+from playground.remote_runner.dispatch import (
+    discover_harbor_job_artifacts,
+    run_harbor_job,
+)
 
 __all__ = ["create_app"]
 
@@ -173,7 +176,14 @@ def _run_harbor_job(run: RemoteRunnerRun) -> dict[str, Any]:
     result = run_harbor_job(run.payload)
     result_path = run.output_dir / "harbor_job_result.json"
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    return {"harbor_job_result.json": result, **result}
+
+    discovered = discover_harbor_job_artifacts(run.payload)
+    manifest = discovered.get("artifact_manifest.json")
+    if manifest is not None:
+        manifest_path = run.output_dir / "artifact_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    return {"harbor_job_result.json": result, **result, **discovered}
 
 
 def _legacy_web_command() -> str:
@@ -266,6 +276,16 @@ def _mock_web_artifacts(run: RemoteRunnerRun) -> dict[str, Any]:
 def _artifact(run: RemoteRunnerRun, name: str) -> Any:
     if name in run.artifacts:
         return run.artifacts[name]
+    try:
+        candidate = (run.output_dir / name).resolve()
+        if (
+            candidate.is_file()
+            and candidate.suffix == ".json"
+            and candidate.is_relative_to(run.output_dir.resolve())
+        ):
+            return json.loads(candidate.read_text(encoding="utf-8"))
+    except (ValueError, RuntimeError):
+        pass
     path = run.output_dir / Path(name).name
     if path.is_file() and path.suffix == ".json":
         return json.loads(path.read_text(encoding="utf-8"))
